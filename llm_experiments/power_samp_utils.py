@@ -28,17 +28,27 @@ from constants import *
 # power sampling to sample from p^{alpha}, where p is the base model
 # takes in 1/alpha (temperature) as an argument (default 0.25), and mcmc_power_samp implements sampling from p^{alpha} 
 
-
+# The AutoregressiveSampler is a safety wrapper. 
+# It ensures you don't feed the model too much text (crashing it), 
+# and it extracts the specific probability distribution for the next word, 
+# ready for a sampling strategy (like Greedy, Temperature, or Nucleus sampling) 
+# to actually choose the word.
 class AutoregressiveSampler:
     def __init__(self, model, tokenizer, device):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.block_size = self.model.config.max_position_embeddings
+        # Context Limit: Every LLM has a hard limit on how much text 
+        # it can read at once (e.g., 2048 or 4096 tokens).
+        # The code extracts this limit (max_position_embeddings) 
+        # and saves it as block_size so the sampler knows when to cut off old text.
 
     # returns log probs
-    @torch.no_grad()
+    @torch.no_grad()# This turns off the "learning" mode (gradient calculation). This drastically reduces memory usage and speeds up the code since we are only generating, not training.
     def next_token(self, prefix):
+      # Input: 'prefix' is a List of Integers (token IDs) representing the text written so far.
+      # Output: A 1D Tensor of Log-Probabilities for the NEXT token.
         device = self.device
         torch_prefix = torch.tensor([prefix], dtype=torch.long, device=device)
         prefix_cond = torch_prefix if torch_prefix.size(1) <= self.block_size else torch_prefix[:, -self.block_size:]

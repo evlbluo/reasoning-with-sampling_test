@@ -224,7 +224,12 @@ def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_ne
     acceptance_ratio = acceptances/attempts
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
-
+# This function is a Prompt Engineer's adapter. 
+# Its job is to take your raw math question and "dress it up" 
+# in the specific format that each different AI model expects to see.
+# Different models (like Qwen, Phi, or Tulu) require different formatting rules
+#—some want raw text, while others require a "Chat Template" (User/Assistant structure).
+# these PROMPT. COT, BASE are stored in constants.py
 def format_prompt(question, model, tokenizer, cot=True):
     if model == "qwen":
         format_str = PROMPT + question

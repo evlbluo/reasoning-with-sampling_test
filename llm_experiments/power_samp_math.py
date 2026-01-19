@@ -135,26 +135,93 @@ if __name__ == "__main__":
     end = 1*(args.batch_idx+1)
 
     for problem, data in tqdm(enumerate(dataset[start:end]), desc = "Benchmark on MATH"):
+      # desc="Benchmark on MATH": This adds the label "Benchmark on MATH" to the left side of the bar 
+      # so you know what task is currently running.
+
+      # tqdm: It wraps the loop to display a live progress bar in your terminal.
+      # enumerate(...): It loops through the data but also keeps track of the index number.
+      # Variables: problem: This variable gets the index number (0, 1, 2...) of the current item.
+      # data: This variable gets the actual content: 
+      #  {
+       # "prompt":"Convert the point $(0,3)$ in rectangular coordinates to polar coordinates.  Enter your answer in the form $(r,\\theta),$ where $r > 0$ and $0 \\le \\theta < 2 \\pi.$",
+       # "answer":"\\left( 3, \\frac{\\pi}{2} \\right)",
+       # "source":"math",
+       # "id":"test/precalculus/807.json"
+       #},
+      #
         question = data["prompt"]
         print(question)
         answer = data["answer"]
 
         input_text = format_prompt(question, model, tokenizer, cot)
+        # This function is a Prompt Engineer's adapter. 
+        # Its job is to take your raw math question and "dress it up" 
+        # in the specific format that each different AI model expects to see.
         input_ids = tokenizer.encode(input_text, return_tensors="pt").to(device)
-        prefx = [idx.item() for idx in input_ids[0]]
+        # "pt" stands for PyTorch.
+        # The Hugging Face tokenizer is designed to work with multiple different 
+        # AI frameworks. This argument tells the tokenizer: "Don't just give me a 
+        # generic list of numbers; give me a PyTorch Tensor because I am about to 
+        # feed this into a PyTorch model."
 
-        naive_temp_output = hf_model.generate(input_ids, max_new_tokens=3072, 
-                                return_dict_in_generate=True, output_scores=True, do_sample = True, temperature = temp)
+        prefx = [idx.item() for idx in input_ids[0]]
+        # This line of code converts your data from a 
+        # PyTorch Tensor (GPU) into a standard Python List (CPU).
+        # Here is what happens to the data at each step of that 
+        #   Step 1: input_ids[0] -> Selects the sequence (removes batch dimension).
+        #   Step 2: idx.item()   -> Extracts the actual integer value from GPU memory to CPU.
+        # Result: A flat list like [101, 205, 30] stored in RAM. 
+        # instead of a [[101, 205, 30]]stored in GPU
+
+        naive_temp_output = hf_model.generate(
+          input_ids, 
+          max_new_tokens=3072, 
+          # Data for Analysis:
+          # Instead of just returning text, force the model to return a dictionary containing Metadata.
+          # 'output_scores=True' ensures we get the confidence scores (log-probs) for every token it generated,
+          # which allows us to mathematically compare how "sure" this model was versus the MCMC method.
+          return_dict_in_generate=True,
+          # Standard generation just returns the text.
+          output_scores=True, 
+          # Controlling Creativity:
+          # 'do_sample=True' enables the "dice roll" (randomness) instead of always picking the #1 word.
+          # the model picks randomly based on probabilities
+          # 'temperature=temp' adjusts the probabilities. 
+          #   - Low temp (e.g., 0.2) = Conservative/Factual.
+          #   - High temp (e.g., 1.2) = Creative/Random (but prone to math errors).
+          do_sample = True, 
+          temperature = temp
+          # Note: The variable temp comes from args.temperature at the top of your script.
+          )
         
         print(tokenizer.decode(naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("naive done")
+        # EXPLANATION OF THE LINE ABOVE:
+        # 1. THE SLICE (naive_temp_output[0][:, len(input_ids[0]):])
+        #    The Problem: The model returns [Original Prompt + New Answer]. We don't want to print the question again.
+        #    The Solution: We calculate the length of the input question 'len(input_ids[0])' and slice the tensor
+        #                  to start reading from AFTER the question ends.
+        #
+        # 2. THE MOVE (.squeeze().to("cpu"))
+        #    .squeeze(): The model outputs a 2D matrix (Batch x Length). This flattens it into a simple 1D list.
+        #    .to("cpu"): The data is currently on the GPU. We cannot print it with standard Python tools,
+        #                so we move it back to system RAM.
+        #
+        # 3. THE DECODING (skip_special_tokens=True)
+        #    Translation: Looks up each ID in the dictionary to find the corresponding word.
+        #    skip_special_tokens: Hides hidden computer codes like <|endoftext|> so the output is clean.
         
-        
-        std_output = hf_model.generate(input_ids, max_new_tokens=3072, 
-                                return_dict_in_generate=True, output_scores=True, do_sample = True)
+        std_output = hf_model.generate(
+          input_ids, max_new_tokens=3072, 
+          return_dict_in_generate=True, 
+          output_scores=True, 
+          do_sample = True
+          )
         
         print(tokenizer.decode(std_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("std done")
+        # naive output: Uses temp (whatever you set in arguments).
+        # std output: Uses 1.0 (The "Natural" state of the model).
 
         mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=3072)
 

@@ -118,7 +118,7 @@ if __name__ == "__main__":
 
     print("loaded models")
     results = []
-    
+
     # batch_idx (short for Batch Index) is a variable that acts 
     # like a "Page Number" for your data.It tells the computer: 
     # "Of all the work we need to do, which specific slice (or batch) 
@@ -131,8 +131,8 @@ if __name__ == "__main__":
     # end = 100 * (0 + 1) → 100
     # The script will load your dataset and process only the first 100 
     # math problems (Index 0 through 99).
-    start = 100*args.batch_idx
-    end = 100*(args.batch_idx+1)
+    start = 1*args.batch_idx
+    end = 1*(args.batch_idx+1)
 
     for problem, data in tqdm(enumerate(dataset[start:end]), desc = "Benchmark on MATH"):
         question = data["prompt"]

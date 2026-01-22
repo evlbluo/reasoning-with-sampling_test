@@ -168,19 +168,31 @@ def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
 
     # --- NEW LOGIC START ---
 
+    # ... inside naive_temp function ...
+
     # 4. PROCESS HIDDEN STATES (h_last)
-    # output.hidden_states is a tuple (length = generated_tokens).
-    # Each element is a tuple (length = num_layers) containing tensors of shape (Batch, 1, Hidden_Size).
+    # output.hidden_states is a tuple (one item per generated token).
+    # Each item is a tuple of layers. We want the LAST layer (-1).
     
-    # We iterate through the generation steps and pick the LAST layer (-1)
-    h_last_steps = [step_tup[-1] for step_tup in output.hidden_states]
+    h_last_steps = []
+    for step_tup in output.hidden_states:
+        # Get the tensor for the last layer
+        last_layer_tensor = step_tup[-1] # Shape could be [1, 72, 3584] or [1, 1, 3584]
+        
+        # We always want the LAST token's state from that step
+        # [:, -1, :] converts [1, 72, 3584] -> [1, 3584]
+        #            converts [1, 1, 3584]  -> [1, 3584]
+        last_token_state = last_layer_tensor[:, -1, :]  
+        
+        h_last_steps.append(last_token_state)
     
-    # Stack them into a single tensor: (Seq_Len, Batch, Hidden_Size)
-    h_last_stacked = torch.stack(h_last_steps, dim=0)
+    # Now all tensors are [Batch, Hidden], so we can stack them
+    h_last_stacked = torch.stack(h_last_steps, dim=0) # Shape: [Seq_Len, Batch, Hidden]
     
     # Squeeze to remove batch dim (assuming batch=1) -> (Seq_Len, Hidden_Size)
-    # We move it to CPU to save GPU memory, as hidden states can be large.
     h_last = h_last_stacked.squeeze(1).cpu()
+
+  
 
     # 5. CALCULATE ENTROPY
     # Entropy measures the uncertainty of the model: H(x) = - sum(p(x) * log(p(x)))

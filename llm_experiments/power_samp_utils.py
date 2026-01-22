@@ -21,8 +21,56 @@ import torch.nn as nn
 from torch.nn import functional as F
 import transformers
 
+
 from grader_utils.parse_utils import parse_answer
 from constants import *
+
+def compute_surprisal(entropy, velocities, window=5):
+    """
+    Combines Entropy and Velocity into a single Smoothed Surprisal Score.
+    
+    Args:
+        entropy (list[float]): List of entropy values per token.
+        velocities (list[float]): List of velocity values per token.
+        window (int): Window size for smoothing (default 5).
+
+    Returns:
+        list[float]: The final smoothed surprisal scores.
+    """
+    # 1. Validation
+    if len(entropy) != len(velocities):
+        raise ValueError(f"Input lengths mismatch! Entropy: {len(entropy)}, Velocities: {len(velocities)}")
+    
+    # 2. Create DataFrame
+    df = pd.DataFrame({
+        "RawEntropy": entropy,
+        "RawVelocity": velocities,
+        "Cluster": 0  # Dummy cluster for grouping
+    })
+
+    # 3. Define Logic Helper
+    def calc_rank_surprisal(s):
+        # Rank: Largest value = Rank 1 (Most Surprising)
+        ranks = s.rank(ascending=False, method="min")
+        # Surprisal = -log(Rank / N)
+        return -np.log(ranks / (len(s) + 1))
+
+    # 4. Apply Calculation
+    grouped = df.groupby("Cluster")
+    
+    # Calculate separate surprisals
+    df["Surprisal_Entropy"] = grouped["RawEntropy"].transform(calc_rank_surprisal)
+    df["Surprisal_Velocity"] = grouped["RawVelocity"].transform(calc_rank_surprisal)
+    
+    # Combine (Sum)
+    df["SurprisalScore"] = df["Surprisal_Entropy"] + df["Surprisal_Velocity"]
+
+    # 5. Smoothing (Moving Average)
+    # min_periods=1 ensures we get values even for short sequences or edges
+    df["Smoothed_Score"] = df["SurprisalScore"].rolling(window=window, center=True, min_periods=1).mean()
+
+    # 6. Return as simple list
+    return df["Smoothed_Score"].tolist()
 
 ### DESCRIPTION ###
 # power sampling to sample from p^{alpha}, where p is the base model
@@ -97,23 +145,63 @@ def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
         return_dict_in_generate=True,
         output_scores=True,
         output_logits=True,
+        output_hidden_states=True,  # <--- NEW: Request hidden states
     )
+    # 3. PROCESS LOGITS (Existing Logic)
+    # output.logits is a tuple of tensors. We stack them to get shape (Seq_Len, Batch, Vocab)
     unscaled_logits = torch.stack(output.logits, dim=0)
     scaled_logits = torch.stack(output.scores, dim=0)
+    
+    # Get the generated tokens (removing the prompt)
     tokens = output.sequences[0][c:]
     prop = output.sequences[0].tolist()
 
+    # Integrity Check
     assert len(tokens) == unscaled_logits.shape[0] == scaled_logits.shape[0]
 
-
+    # Calculate Log Probs (Existing Logic)
+    # Reshape tokens to (Seq, 1, 1) for gathering from the logits tensor
     idx = tokens.view(unscaled_logits.shape[0], 1, 1)
 
     log_probs_unnorm = (1/temp * torch.gather(F.log_softmax(unscaled_logits, dim=-1), -1, idx)).view(-1).tolist()
     log_probs_norm = torch.gather(F.log_softmax(scaled_logits, dim=-1), -1, idx).view(-1).tolist()
 
-    assert len(tokens) == len(log_probs_unnorm) == len(log_probs_norm)
+    # --- NEW LOGIC START ---
 
-    return prop, log_probs_norm, log_probs_unnorm
+    # 4. PROCESS HIDDEN STATES (h_last)
+    # output.hidden_states is a tuple (length = generated_tokens).
+    # Each element is a tuple (length = num_layers) containing tensors of shape (Batch, 1, Hidden_Size).
+    
+    # We iterate through the generation steps and pick the LAST layer (-1)
+    h_last_steps = [step_tup[-1] for step_tup in output.hidden_states]
+    
+    # Stack them into a single tensor: (Seq_Len, Batch, Hidden_Size)
+    h_last_stacked = torch.stack(h_last_steps, dim=0)
+    
+    # Squeeze to remove batch dim (assuming batch=1) -> (Seq_Len, Hidden_Size)
+    # We move it to CPU to save GPU memory, as hidden states can be large.
+    h_last = h_last_stacked.squeeze(1).cpu()
+
+    # 5. CALCULATE ENTROPY
+    # Entropy measures the uncertainty of the model: H(x) = - sum(p(x) * log(p(x)))
+    # We use 'unscaled_logits' to measure the BASE model's uncertainty (ignoring temperature).
+    
+    probs = F.softmax(unscaled_logits, dim=-1)
+    log_probs = F.log_softmax(unscaled_logits, dim=-1)
+    
+    # Calculate entropy for each token step
+    entropy_tensor = -torch.sum(probs * log_probs, dim=-1) # Shape: (Seq_Len, Batch)
+    
+    # Flatten and convert to list
+    entropy = entropy_tensor.view(-1).tolist()
+
+    # --- NEW LOGIC END ---
+
+    # Final Integrity Check
+    assert len(tokens) == len(log_probs_unnorm) == len(log_probs_norm) == len(entropy) == h_last.size(0)
+
+    # Return prop (list), log_probs (lists), h_last (Tensor), entropy (list)
+    return prop, log_probs_norm, log_probs_unnorm, h_last, entropy
 
 
 # alpha = infty power sampling; temp is for proposal distribution
@@ -136,7 +224,7 @@ def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_token
 
 
     for _ in tqdm(range(block_num)):
-        gen, lp_norm, lp_unnorm = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
+        gen, lp_norm, lp_unnorm,h_last, entropy = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
         log_probs_norm.extend(lp_norm)
         log_probs_unnorm.extend(lp_unnorm)
 
@@ -145,7 +233,7 @@ def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_token
             t = len(gen)
             idx = random.randint(c, t-1)
             # llm query takes the burden of time
-            prop, log_prob_prop, target_log_prob_prop = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
+            prop, log_prob_prop, target_log_prob_prop,prop_h_last, prop_entropy = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
             s = len(prop)
             assert(len(log_prob_prop) == s - idx)
             assert(len(target_log_prob_prop) == s - idx)
@@ -193,12 +281,18 @@ def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_ne
     # 'norm' = Normalized Log Probabilities (Proposal Distribution Q).
     # 'unnorm' = Unnormalized Log Probabilities (Target Distribution P).
 
+    # [NEW] Lists to store the history of the entire generated sequence
+    # We only track metrics for the *generated* part (after context 'c')
+    full_entropy = [] 
+    full_h_last = torch.tensor([], device='cpu') # Initialize empty tensor
+
     # 2. BLOCK PLANNING
     # Print total tokens to generate (debugging info).
     print(max_new_tokens)
     assert max_new_tokens % block_num == 0
     jump_size = int(max_new_tokens // block_num)
     print(jump_size)
+
     attempts = 0
     acceptances = 0
 
@@ -206,9 +300,20 @@ def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_ne
     # This loop runs 16 times (block_num). Each time, 
     # it extends the story by 'jump_size' tokens.
     for _ in tqdm(range(block_num)):
-        gen, lp_norm, lp_unnorm = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
+        gen, lp_norm, lp_unnorm,h_last, entropy = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
         log_probs_norm.extend(lp_norm)
         log_probs_unnorm.extend(lp_unnorm)
+        # 方案：利用切片错位计算 (Vectorized)
+        # h_last[:-1] 是从第 0 个到倒数第 2 个
+        # h_last[1:]  是从第 1 个到最后 1 个
+        # dim=-1 表示在向量维度上计算相似度
+
+        sims = F.cosine_similarity(h_last[:-1], h_last[1:], dim=-1)
+        velocities = (1 - sims).tolist() + [0.0]
+        print(f"raw_h_last shape: {h_last.shape}")   # Tensor 用 .shape
+        print(f"Entropy length: {len(entropy)}")      # List 用 len()
+        print(f"Velocities length: {len(velocities)}") # List 用 len()
+        surprisal_scores = compute_surprisal(entropy, velocities)
 
         for _ in tqdm(range(mcmc_steps)):
             attempts+=1
@@ -224,7 +329,7 @@ def mcmc_power_samp(p : AutoregressiveSampler, context, temp, mcmc_steps, max_ne
             # llm query takes the burden of time
 
             # 5. GENERATE PROPOSAL (The Rewrite)
-            prop, log_prob_prop, target_log_prob_prop = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
+            prop, log_prob_prop, target_log_prob_prop,prop_h_last, prop_entropy = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
             
             # Take the text up to the cut point (gen[:idx]) and ask the model to generate a NEW ending
             # that reaches the same length 't'.

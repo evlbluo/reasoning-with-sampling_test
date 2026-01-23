@@ -223,7 +223,22 @@ if __name__ == "__main__":
         # naive output: Uses temp (whatever you set in arguments).
         # std output: Uses 1.0 (The "Natural" state of the model).
 
-        mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=3072)
+        #mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=3072)
+        mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp_with_plot(
+          autoreg_sampler,
+          prefx,
+          temp,
+          mcmc_steps,
+          max_new_tokens=3072,
+          block_num=16,
+          plot_every=1,          # Plot every N MCMC steps
+          save_plots=True,
+          plot_dir="mcmc_plots",
+          use_plotly=True,
+          window_size=5,
+          peak_distance=10,
+          peak_prominence=0.3,
+        )
 
         print(len(std_output))
         print(len(naive_temp_output))

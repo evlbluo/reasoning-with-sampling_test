@@ -41,7 +41,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", action = "store", default = 0.25, type = float, dest = "temperature")
     parser.add_argument("--dataset", action = "store", default = "MATH", type = str)
     parser.add_argument("--cot", action = "store", type = bool, default = True)
-    parser.add_argument("--mcmc_steps", action = "store", type = int, default = 10)
+    parser.add_argument("--mcmc_steps", action = "store", type = int, default = 3)
     parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)

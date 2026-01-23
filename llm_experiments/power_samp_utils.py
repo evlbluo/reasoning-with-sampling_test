@@ -16,10 +16,15 @@ from dataclasses import dataclass
 from datasets import Dataset, load_dataset, concatenate_datasets
 
 
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import transformers
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+from scipy.ndimage import uniform_filter1d
+
 
 
 from grader_utils.parse_utils import parse_answer

@@ -25,6 +25,28 @@ import transformers
 from grader_utils.parse_utils import parse_answer
 from constants import *
 
+def print_full_tokens(tokenizer, ids, title=""):
+    """
+    ids: 1D torch tensor on CPU (dtype long), e.g. [seq_len]
+    """
+    ids_list = ids.tolist()
+    toks = tokenizer.convert_ids_to_tokens(ids_list)
+
+    if title:
+        print(f"\n===== {title} =====")
+    print(f"Total tokens: {len(ids_list)}")
+
+    # 1) 打印完整文本（包含 prompt + completion）
+    full_text = tokenizer.decode(ids_list, skip_special_tokens=False)
+    print("\n[Full decoded text]")
+    print(full_text)
+
+    # 2) 打印每个 token（含 id）
+    print("\n[Token list: index | id | token]")
+    for i, (tid, tok) in enumerate(zip(ids_list, toks)):
+        print(f"{i:04d} | {tid:>6d} | {tok}")
+
+
 def plot_surprisal_timeline_matplotlib(
     surprisal_scores,
     entropy,

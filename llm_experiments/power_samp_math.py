@@ -196,6 +196,8 @@ if __name__ == "__main__":
         
         print(tokenizer.decode(naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("naive done")
+        naive_seq = naive_temp_output.sequences[0].detach().to("cpu")   # full: prompt + completion
+        print_full_tokens(tokenizer, naive_seq, title="NAIVE (full prompt+completion)")
         # EXPLANATION OF THE LINE ABOVE:
         # 1. THE SLICE (naive_temp_output[0][:, len(input_ids[0]):])
         #    The Problem: The model returns [Original Prompt + New Answer]. We don't want to print the question again.
@@ -220,6 +222,8 @@ if __name__ == "__main__":
         
         print(tokenizer.decode(std_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("std done")
+        std_seq = std_output.sequences[0].detach().to("cpu")            # full: prompt + completion
+        print_full_tokens(tokenizer, std_seq, title="STD (full prompt+completion)")
         # naive output: Uses temp (whatever you set in arguments).
         # std output: Uses 1.0 (The "Natural" state of the model).
 

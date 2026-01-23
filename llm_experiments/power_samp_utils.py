@@ -25,6 +25,14 @@ import transformers
 from grader_utils.parse_utils import parse_answer
 from constants import *
 
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    USE_PLOTLY = True
+except ImportError:
+    USE_PLOTLY = False
+    print("Plotly not available, using matplotlib for plotting")
+
 def print_full_tokens(tokenizer, ids, title=""):
     """
     ids: 1D torch tensor on CPU (dtype long), e.g. [seq_len]

@@ -724,7 +724,7 @@ def plot_surprisal_timeline_matplotlib(
     steps = np.arange(len(surprisal_scores))
     
     # Smooth the surprisal scores
-    smoothed_surprisal = uniform_filter1d(surprisal_scores, size=window_size)
+    smoothed_surprisal = np.array(surprisal_scores)
     
     # Detect peaks
     peaks, properties = find_peaks(
@@ -879,7 +879,7 @@ def plot_surprisal_timeline_plotly(
     steps = np.arange(len(surprisal_scores))
     
     # Smooth the surprisal scores
-    smoothed_surprisal = uniform_filter1d(surprisal_scores, size=window_size)
+    smoothed_surprisal = np.array(surprisal_scores)
     
     # Detect peaks
     peaks, _ = find_peaks(smoothed_surprisal, distance=peak_distance, prominence=peak_prominence)

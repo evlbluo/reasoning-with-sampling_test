@@ -56,7 +56,7 @@ if __name__ == "__main__":
                         help = "Number of bins B for the bin-bandit (fixed, bin size adapts to window)")
     parser.add_argument("--adaptive_delta", action = "store", type = float, default = 0.1,
                         help = "Mix factor for surprisal prior with uniform distribution")
-    parser.add_argument("--adaptive_epsilon", action = "store", type = float, default = 0.1,
+    parser.add_argument("--adaptive_epsilon", action = "store", type = float, default = 0.3,
                         help = "Probability of forced uniform exploration")
     parser.add_argument("--adaptive_refractory_radius", action = "store", type = int, default = 9,
                         help = "Radius W for anti-repeat refractory masking")
@@ -147,8 +147,8 @@ if __name__ == "__main__":
     # end = 100 * (0 + 1) → 100
     # The script will load your dataset and process only the first 100 
     # math problems (Index 0 through 99).
-    start = 1*args.batch_idx
-    end = 1*(args.batch_idx+1)
+    start = 3*args.batch_idx
+    end = 3*(args.batch_idx+1)
 
     for problem, data in tqdm(enumerate(dataset[start:end]), desc = "Benchmark on MATH"):
       # desc="Benchmark on MATH": This adds the label "Benchmark on MATH" to the left side of the bar 

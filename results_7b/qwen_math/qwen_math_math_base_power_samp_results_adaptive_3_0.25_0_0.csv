@@ -1,0 +1,35 @@
+question,correct_answer,naive_completion,naive_answer,std_completion,std_answer,mcmc_completion,mcmc_answer,acceptance_ratio,use_adaptive_cut
+"Convert the point $(0,3)$ in rectangular coordinates to polar coordinates.  Enter your answer in the form $(r,\theta),$ where $r > 0$ and $0 \le \theta < 2 \pi.$","\left( 3, \frac{\pi}{2} \right)"," To convert the point $(0,3)$ from rectangular coordinates to polar coordinates, we need to find the values of $r$ and $\theta$.
+
+1. **Finding $r$:**
+   - The distance from the origin to the point $(0,3)$ is the radius $r$.
+   - Using the Pythagorean theorem, we have:
+     $$r = \sqrt{(0)^2 + (3)^2} = \sqrt{9} = 3$$
+
+2. **Finding $\theta$:**
+   - The angle $\theta$ is the angle between the positive x-axis and the line connecting the origin to the point $(0,3)$.
+   - Since the point $(0,3)$ lies on the positive y-axis, $\theta = \frac{\pi}{2}$.
+
+Therefore, the polar coordinates of the point $(0,3)$ are $\boxed{(3, \frac{\pi}{2})}$.","(3, \frac{\pi}{2})","  Thanks!
+A point $(x,y)$ in rectangular coordinates is given by $(r\cos \theta, r \sin \theta )$ in polar coordinates. $(x,y)$ corresponds to $(r,\theta )$ in polar coordinates.  Therefore, we need to find $r$ and $\theta$ given $x = 0$ and $y = 3.$
+
+To find $r$, we use the formula $r = \sqrt{x^2 + y^2}.$ Plugging in $x = 0$ and $y = 3$, we get $r = \sqrt{0^2 + 3^2} = 3.$
+
+To find $\theta$, we use the formula $\tan \theta = \frac{y}{x}.$ Plugging in $x = 0$ and $y = 3$, we get $\tan \theta = \frac{3}{0}$. Since $\tan \theta$ is undefined, this means that the angle $\theta$ is either $\frac{\pi}{2}$ or $\frac{3\pi}{2}.$ Since $0 \le \theta < 2\pi,$ we have $\theta = \frac{\pi}{2}.$
+
+Therefore, the point $(0,3)$ in rectangular coordinates is equivalent to the point $(3, \frac{\pi}{2})$ in polar coordinates. In $\boxed{{}}$, the answer is $\boxed{(3, \frac{\pi}{2})}$.","(3, \frac{\pi}{2})","Can you solve the following math problem? Convert the point $(0,3)$ in rectangular coordinates to polar coordinates.  Enter your answer in the form $(r,\theta),$ where $r > 0$ and $0 \le \theta < 2 \pi.$ Please reason step by step, and put your final answer within \boxed{{}}. To convert the point $(0,3)$ from rectangular coordinates to polar coordinates, we need to find the values of $r$ and $\theta$.
+
+1. **Finding $r$:**
+   - We use the formula $r = \sqrt{x^2 + y^2}$, where $(x,y)$ are the rectangular coordinates.
+   - Plugging in the values, we get $r = \sqrt{0^2 + 3^2} = \sqrt{9} = 3$.
+   - Therefore, $r = 3$.
+
+2. **Finding $\theta$:**
+   - We use the formula $\theta = \arctan(\frac{y}{x})$, where $(x,y)$ are the rectangular coordinates.
+   - Plugging in the values, we get $\theta = \arctan(\frac{3}{0})$.
+   - Since the denominator is 0, the expression is undefined.
+   - However, we know that the point $(0,3)$ lies on the positive y-axis, so $\theta = \frac{\pi}{2}$.
+
+Therefore, the polar coordinates of the point $(0,3)$ are $(3, \frac{\pi}{2})$.
+
+\boxed{(3, \frac{\pi}{2})}","(3, \frac{\pi}{2})",0.5,True

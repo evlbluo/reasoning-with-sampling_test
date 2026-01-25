@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datasets import Dataset, load_dataset, concatenate_datasets
 
 
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -23,6 +24,7 @@ import transformers
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from scipy.ndimage import uniform_filter1d
+
 
 
 from grader_utils.parse_utils import parse_answer
@@ -35,6 +37,646 @@ try:
 except ImportError:
     USE_PLOTLY = False
     print("Plotly not available, using matplotlib for plotting")
+
+
+# =============================================================================
+# ADAPTIVE CUT-POINT SELECTION: Bin-Bandit with Surprisal Prior
+# =============================================================================
+
+class BinBandit:
+    """
+    EXP3-style multi-armed bandit for bin selection.
+    
+    Partitions the cut-point window into B bins and learns which bins
+    lead to more accepted proposals, without any additional model calls.
+    """
+    
+    def __init__(
+        self, 
+        num_bins=10, 
+        gamma=0.1,      # Exploration rate for bin selection
+        eta=0.1,        # Learning rate for weight updates
+        decay=0.02,     # Weight decay for non-stationarity
+        epsilon=1e-8,   # Small constant for numerical stability
+        verbose=True    # Whether to print detailed logs
+    ):
+        """
+        Args:
+            num_bins: Number of bins (B)
+            gamma: Exploration floor for EXP3 (mix with uniform)
+            eta: Learning rate for exponential weight updates
+            decay: Weight decay factor (lambda) for forgetting
+            epsilon: Small constant for numerical stability
+            verbose: Whether to print detailed logs
+        """
+        self.num_bins = num_bins
+        self.gamma = gamma
+        self.eta = eta
+        self.decay = decay
+        self.epsilon = epsilon
+        self.verbose = verbose
+        
+        # Initialize weights uniformly
+        self.weights = np.ones(num_bins, dtype=np.float64)
+        
+        # Statistics tracking
+        self.bin_attempts = np.zeros(num_bins, dtype=np.int64)
+        self.bin_accepts = np.zeros(num_bins, dtype=np.int64)
+        
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"[BinBandit] Initialized with {num_bins} bins")
+            print(f"  - gamma (exploration): {gamma}")
+            print(f"  - eta (learning rate): {eta}")
+            print(f"  - decay: {decay}")
+            print(f"{'='*60}\n")
+    
+    def get_bin_distribution(self):
+        """
+        Compute EXP3-style bin selection distribution.
+        
+        Returns:
+            p_bin: Array of probabilities for each bin
+        """
+        # Normalize weights
+        w_sum = np.sum(self.weights)
+        p_exploit = self.weights / (w_sum + self.epsilon)
+        
+        # Mix with uniform for exploration
+        p_uniform = np.ones(self.num_bins) / self.num_bins
+        p_bin = (1 - self.gamma) * p_exploit + self.gamma * p_uniform
+        
+        return p_bin
+    
+    def sample_bin(self):
+        """
+        Sample a bin according to the EXP3 distribution.
+        
+        Returns:
+            bin_idx: Sampled bin index
+            p_bin: The probability distribution used
+        """
+        p_bin = self.get_bin_distribution()
+        bin_idx = np.random.choice(self.num_bins, p=p_bin)
+        return bin_idx, p_bin
+    
+    def update(self, bin_idx, reward, p_bin, verbose_step=False):
+        """
+        Update bin weights based on reward (acceptance).
+        
+        Args:
+            bin_idx: The bin that was selected
+            reward: Reward signal (1 for accept, 0 for reject, or clipped log_r)
+            p_bin: The probability distribution used for selection
+            verbose_step: Whether to print this specific update
+        """
+        self.bin_attempts[bin_idx] += 1
+        if reward > 0:
+            self.bin_accepts[bin_idx] += 1
+        
+        old_weight = self.weights[bin_idx]
+        
+        # EXP3-style importance-weighted update
+        importance_weight = reward / (p_bin[bin_idx] + self.epsilon)
+        self.weights[bin_idx] *= np.exp(self.eta * importance_weight)
+        
+        # Prevent numerical overflow
+        if np.max(self.weights) > 1e6:
+            self.weights /= np.max(self.weights)
+        
+        if self.verbose and verbose_step:
+            print(f"    [Bandit Update] Bin {bin_idx}: weight {old_weight:.4f} -> {self.weights[bin_idx]:.4f} (reward={reward:.2f})")
+    
+    def apply_decay(self):
+        """
+        Apply weight decay to handle non-stationarity.
+        Moves weights toward uniform distribution.
+        """
+        old_weights = self.weights.copy()
+        uniform = np.ones(self.num_bins)
+        self.weights = (1 - self.decay) * self.weights + self.decay * uniform
+        
+        if self.verbose:
+            print(f"  [Bandit Decay] Applied decay (λ={self.decay})")
+            print(f"    Max weight change: {np.max(np.abs(self.weights - old_weights)):.6f}")
+    
+    def get_stats(self):
+        """Return statistics about bin performance."""
+        return {
+            'weights': self.weights.copy(),
+            'attempts': self.bin_attempts.copy(),
+            'accepts': self.bin_accepts.copy(),
+            'acceptance_rates': np.where(
+                self.bin_attempts > 0,
+                self.bin_accepts / self.bin_attempts,
+                0.0
+            )
+        }
+
+
+class AdaptiveCutPointSampler:
+    """
+    Adaptive cut-point selection using:
+    1. Surprisal prior (within-bin localization)
+    2. Bin-bandit (coarse adaptation via EXP3)
+    3. Refractory masking (anti-repeat)
+    
+    NOTE: Window size L is FIXED and determined by:
+        L = max_new_tokens // block_num (i.e., jump_size)
+    
+    For example: max_new_tokens=3072, block_num=16 -> L=192
+    With num_bins=10: first 9 bins have 19 tokens, last bin has 21 tokens
+    """
+    
+    def __init__(
+        self,
+        window_size,            # L: fixed window size = jump_size = max_new_tokens // block_num
+        num_bins=10,            # B: number of bins
+        delta=0.1,              # Mix factor for surprisal prior with uniform
+        epsilon_explore=0.1,    # Forced exploration probability
+        refractory_radius=10,   # W: radius for anti-repeat masking
+        refractory_factor=0.01, # Downweight factor for refractory region
+        bandit_gamma=0.1,       # Exploration rate for bandit
+        bandit_eta=0.1,         # Learning rate for bandit
+        bandit_decay=0.02,      # Weight decay for bandit
+        smoothing_epsilon=1e-6, # Small constant for surprisal smoothing
+        verbose=True            # Whether to print detailed logs
+    ):
+        """
+        Args:
+            window_size: Fixed window size L = max_new_tokens // block_num
+            num_bins: Number of bins (B)
+            delta: Mix factor for surprisal prior with uniform
+            epsilon_explore: Probability of forced uniform exploration
+            refractory_radius: Radius W for anti-repeat masking
+            refractory_factor: Multiplicative factor for refractory region
+            bandit_gamma: Exploration rate for EXP3
+            bandit_eta: Learning rate for EXP3 updates
+            bandit_decay: Weight decay for non-stationarity
+            smoothing_epsilon: Small constant added to surprisal scores
+            verbose: Whether to print detailed logs
+        """
+        self.window_size = window_size  # L = jump_size
+        self.num_bins = num_bins        # B
+        self.verbose = verbose
+        
+        # Compute bin sizes: L = B * K + remainder
+        # First (B-1) bins have size K, last bin has size K + remainder
+        self.base_bin_size = window_size // num_bins  # K
+        self.remainder = window_size % num_bins
+        
+        # Bin boundaries: bins[i] = (start, end) for bin i
+        # First (num_bins - 1) bins have base_bin_size tokens
+        # Last bin has (base_bin_size + remainder) tokens
+        self.bin_boundaries = []
+        pos = 0
+        for b in range(num_bins):
+            if b < num_bins - 1:
+                bin_size = self.base_bin_size
+            else:
+                bin_size = self.base_bin_size + self.remainder  # Last bin gets remainder
+            self.bin_boundaries.append((pos, pos + bin_size))
+            pos += bin_size
+        
+        self.delta = delta
+        self.epsilon_explore = epsilon_explore
+        self.refractory_radius = refractory_radius
+        self.refractory_factor = refractory_factor
+        self.smoothing_epsilon = smoothing_epsilon
+        
+        # Initialize bandit
+        self.bandit = BinBandit(
+            num_bins=num_bins,
+            gamma=bandit_gamma,
+            eta=bandit_eta,
+            decay=bandit_decay,
+            verbose=verbose
+        )
+        
+        # CRITICAL FIX: Store last accepted cut position in GLOBAL coordinates
+        # This prevents the refractory mask from drifting when the window slides
+        self.last_accepted_global_idx = None
+        
+        # Statistics
+        self.total_samples = 0
+        self.exploration_samples = 0
+        
+        if self.verbose:
+            print(f"\n{'='*60}")
+            print(f"[AdaptiveCutPointSampler] Configuration:")
+            print(f"  - Window size (L): {window_size} (fixed = max_new_tokens // block_num)")
+            print(f"  - Num bins (B): {num_bins}")
+            print(f"  - Base bin size (K): {self.base_bin_size}")
+            print(f"  - Remainder: {self.remainder} (added to last bin)")
+            print(f"  - Bin sizes: first {num_bins-1} bins = {self.base_bin_size}, last bin = {self.base_bin_size + self.remainder}")
+            print(f"  - Bin boundaries: {self.bin_boundaries}")
+            print(f"  - Delta (uniform mix): {delta}")
+            print(f"  - Epsilon (exploration prob): {epsilon_explore}")
+            print(f"  - Refractory radius (W): {refractory_radius}")
+            print(f"  - Refractory factor: {refractory_factor}")
+            print(f"  - NOTE: Refractory center stored in GLOBAL coordinates")
+            print(f"{'='*60}\n")
+    
+    def get_bin_for_position(self, local_idx):
+        """Get which bin a local position belongs to."""
+        for b, (start, end) in enumerate(self.bin_boundaries):
+            if start <= local_idx < end:
+                return b
+        return self.num_bins - 1  # Default to last bin
+    
+    def compute_surprisal_prior(self, surprisal_scores):
+        """
+        Compute surprisal-based prior distribution over window positions.
+        
+        Args:
+            surprisal_scores: Surprisal scores for the window (length should = window_size)
+            
+        Returns:
+            p_prior: Prior distribution over local window positions [0, L)
+        """
+        L = len(surprisal_scores)
+        
+        if L == 0:
+            return np.ones(self.window_size) / self.window_size
+        
+        # Pad or truncate to window_size
+        if L < self.window_size:
+            surprisal_scores = np.concatenate([
+                surprisal_scores,
+                np.ones(self.window_size - L) * np.mean(surprisal_scores) if L > 0 else np.ones(self.window_size - L)
+            ])
+        elif L > self.window_size:
+            surprisal_scores = surprisal_scores[:self.window_size]
+        
+        # Ensure non-negative and add epsilon
+        s_tilde = np.maximum(surprisal_scores, 0) + self.smoothing_epsilon
+        
+        # Normalize to get surprisal prior
+        p_sur = s_tilde / (np.sum(s_tilde) + self.smoothing_epsilon)
+        
+        # Mix with uniform
+        p_uniform = np.ones(self.window_size) / self.window_size
+        p_prior = (1 - self.delta) * p_sur + self.delta * p_uniform
+        
+        return p_prior
+    
+    def apply_refractory_mask(self, p_prior, window_start, actual_window_size):
+        """
+        Apply refractory masking to prevent repeated cuts at same location.
+        
+        CRITICAL FIX: Uses GLOBAL coordinates for refractory center.
+        The mask is applied only if the last accepted position falls within
+        the current window.
+        
+        Args:
+            p_prior: Prior distribution over local window positions
+            window_start: Global index where the window starts
+            actual_window_size: Size of the current window
+            
+        Returns:
+            p_masked: Masked and renormalized prior distribution
+        """
+        if self.last_accepted_global_idx is None:
+            return p_prior
+        
+        # Convert global refractory center to local coordinate
+        refractory_local = self.last_accepted_global_idx - window_start
+        
+        # Check if refractory center is within or near the current window
+        # It affects the window if it's within [−W, actual_window_size + W)
+        if refractory_local < -self.refractory_radius or refractory_local >= actual_window_size + self.refractory_radius:
+            # Refractory center is too far from current window, no masking needed
+            if self.verbose:
+                print(f"    Refractory center (global={self.last_accepted_global_idx}, local={refractory_local}) outside window range, skipping mask")
+            return p_prior
+        
+        p_masked = p_prior.copy()
+        
+        # OPTIONAL FIX: Vectorized refractory masking (more efficient)
+        lo = max(0, refractory_local - self.refractory_radius)
+        hi = min(len(p_masked), refractory_local + self.refractory_radius + 1)
+        
+        if lo < hi:
+            p_masked[lo:hi] *= self.refractory_factor
+        
+        # Renormalize
+        total = np.sum(p_masked)
+        if total > self.smoothing_epsilon:
+            p_masked /= total
+        else:
+            # Fallback to uniform if all mass was suppressed
+            p_masked = np.ones(len(p_masked)) / len(p_masked)
+        
+        return p_masked
+    
+    def sample_cut_point(self, context_len, seq_len, surprisal_scores, mcmc_step=None, block_idx=None):
+        """
+        Sample a cut point using the adaptive method.
+        
+        The window covers the TRAILING L tokens of the generated sequence:
+            window_start = max(context_len, seq_len - L)
+            window covers positions [window_start, seq_len)
+        
+        Args:
+            context_len: Length of prompt/context (c)
+            seq_len: Current total sequence length (t)
+            surprisal_scores: Surprisal scores for the window (should have length = actual_window_size)
+            mcmc_step: Current MCMC step (for logging)
+            block_idx: Current block index (for logging)
+            
+        Returns:
+            idx: Global cut point index
+            sampling_info: Dict with sampling details for logging (includes sampled_bin_idx for update)
+        """
+        self.total_samples += 1
+        
+        # Window covers the trailing L tokens
+        # s = max(c, t - L)
+        window_start = max(context_len, seq_len - self.window_size)
+        actual_window_size = seq_len - window_start
+        
+        if self.verbose:
+            print(f"\n  [CutPoint Sample #{self.total_samples}] Block={block_idx}, MCMC={mcmc_step}")
+            print(f"    Sequence: context_len(c)={context_len}, seq_len(t)={seq_len}")
+            print(f"    Window: start(s)={window_start}, actual_size={actual_window_size}, expected(L)={self.window_size}")
+        
+        # Handle edge case: very short sequence
+        if actual_window_size <= 1:
+            idx = context_len
+            if self.verbose:
+                print(f"    -> Edge case: window too small, using idx={idx}")
+            return idx, {'method': 'edge_case', 'idx': idx, 'window_start': window_start, 'sampled_bin_idx': None}
+        
+        # Ensure surprisal_scores matches actual_window_size
+        surprisal_scores = np.array(surprisal_scores)
+        if len(surprisal_scores) != actual_window_size:
+            if self.verbose:
+                print(f"    Adjusting surprisal_scores: {len(surprisal_scores)} -> {actual_window_size}")
+            if len(surprisal_scores) > actual_window_size:
+                surprisal_scores = surprisal_scores[-actual_window_size:]
+            else:
+                pad_size = actual_window_size - len(surprisal_scores)
+                mean_val = np.mean(surprisal_scores) if len(surprisal_scores) > 0 else 1.0
+                surprisal_scores = np.concatenate([np.ones(pad_size) * mean_val, surprisal_scores])
+        
+        # IMPORTANT FIX: Derive bin boundaries directly from actual_window_size
+        # to avoid empty bins from integer truncation scaling
+        if actual_window_size < self.window_size:
+            # Recompute boundaries for smaller window
+            base_size = actual_window_size // self.num_bins
+            remainder = actual_window_size % self.num_bins
+            current_boundaries = []
+            pos = 0
+            for b in range(self.num_bins):
+                if b < self.num_bins - 1:
+                    bin_size = base_size
+                else:
+                    bin_size = base_size + remainder
+                # Ensure non-empty bins (at least 1 token if possible)
+                if bin_size == 0 and pos < actual_window_size:
+                    bin_size = 1
+                end_pos = min(pos + bin_size, actual_window_size)
+                current_boundaries.append((pos, end_pos))
+                pos = end_pos
+            if self.verbose:
+                print(f"    Scaled bin boundaries for smaller window: {current_boundaries}")
+        else:
+            current_boundaries = self.bin_boundaries
+        
+        # Compute surprisal prior
+        # Ensure non-negative and add epsilon
+        s_tilde = np.maximum(surprisal_scores, 0) + self.smoothing_epsilon
+        p_sur = s_tilde / (np.sum(s_tilde) + self.smoothing_epsilon)
+        
+        # Mix with uniform
+        p_uniform = np.ones(actual_window_size) / actual_window_size
+        p_prior = (1 - self.delta) * p_sur + self.delta * p_uniform
+        
+        # Apply refractory masking (CRITICAL FIX: pass window_start for global->local conversion)
+        p_masked = self.apply_refractory_mask(p_prior, window_start, actual_window_size)
+        
+        # Log surprisal statistics
+        if self.verbose:
+            top_k = min(5, actual_window_size)
+            top_indices = np.argsort(surprisal_scores)[-top_k:][::-1]
+            print(f"    Surprisal stats: mean={np.mean(surprisal_scores):.3f}, max={np.max(surprisal_scores):.3f}")
+            print(f"    Top-{top_k} surprisal positions (local): {top_indices.tolist()}")
+        
+        # Log refractory info with GLOBAL coordinates
+        if self.verbose and self.last_accepted_global_idx is not None:
+            refractory_local = self.last_accepted_global_idx - window_start
+            print(f"    Refractory center: global={self.last_accepted_global_idx}, local={refractory_local}, radius={self.refractory_radius}")
+        
+        sampling_info = {
+            'window_start': window_start,
+            'window_size': self.window_size,
+            'actual_window_size': actual_window_size,
+            'context_len': context_len,
+            'seq_len': seq_len,
+            'bin_boundaries': current_boundaries,
+            'sampled_bin_idx': None  # Will be set if bandit is used
+        }
+        
+        # Epsilon-exploration: uniform random
+        if np.random.rand() < self.epsilon_explore:
+            self.exploration_samples += 1
+            local_idx = np.random.randint(0, actual_window_size)
+            idx = window_start + local_idx
+            sampling_info.update({
+                'method': 'epsilon_exploration',
+                'local_idx': local_idx,
+                'idx': idx,
+                'sampled_bin_idx': None  # No bin sampled during exploration
+            })
+            if self.verbose:
+                print(f"    -> EXPLORATION: uniform random, local_idx={local_idx}, global_idx={idx}")
+            return idx, sampling_info
+        
+        # Sample bin using bandit
+        sampled_bin_idx, p_bin = self.bandit.sample_bin()
+        
+        # Get bin boundaries for current window
+        bin_start, bin_end = current_boundaries[sampled_bin_idx]
+        
+        # Safety checks for empty bins
+        if bin_end <= bin_start:
+            if self.verbose:
+                print(f"    WARNING: Empty bin {sampled_bin_idx}, range=[{bin_start}, {bin_end}), using fallback")
+            # Fallback: sample uniformly from entire window
+            local_idx = np.random.randint(0, actual_window_size)
+            
+            # CRITICAL FIX (Issue 2): Recompute the ACTUAL bin from the fallback position
+            # This ensures we update the bin that actually produced the cut point
+            actual_bin_idx = None
+            for b, (bs, be) in enumerate(current_boundaries):
+                if bs <= local_idx < be:
+                    actual_bin_idx = b
+                    break
+            
+            if self.verbose:
+                print(f"    Fallback sampled local_idx={local_idx}, actual_bin={actual_bin_idx} (not empty-bin {sampled_bin_idx})")
+            
+            # Use actual_bin_idx for update, NOT sampled_bin_idx
+            sampled_bin_idx = actual_bin_idx  # Override with actual bin
+        else:
+            if self.verbose:
+                print(f"    Bandit selected bin {sampled_bin_idx} (p={p_bin[sampled_bin_idx]:.4f}), range=[{bin_start}, {bin_end})")
+                print(f"    Bin weights: {np.round(self.bandit.weights, 3).tolist()}")
+            
+            # Sample within bin using masked prior
+            bin_probs = p_masked[bin_start:bin_end]
+            bin_sum = np.sum(bin_probs)
+            
+            if bin_sum > self.smoothing_epsilon:
+                bin_probs = bin_probs / bin_sum
+            else:
+                bin_probs = np.ones(bin_end - bin_start) / (bin_end - bin_start)
+            
+            local_in_bin = np.random.choice(len(bin_probs), p=bin_probs)
+            local_idx = bin_start + local_in_bin
+        
+        # Convert to global index
+        idx = window_start + local_idx
+        
+        # Store the ACTUAL bin used (may differ from originally sampled if fallback occurred)
+        sampling_info.update({
+            'method': 'bandit_surprisal',
+            'sampled_bin_idx': sampled_bin_idx,  # This is now the ACTUAL bin (fixed for fallback)
+            'bin_start': bin_start,
+            'bin_end': bin_end,
+            'local_idx': local_idx,
+            'idx': idx,
+            'p_bin': p_bin.tolist(),
+            'surprisal_at_cut': float(surprisal_scores[local_idx]) if local_idx < len(surprisal_scores) else None
+        })
+        
+        if self.verbose:
+            surp_val = sampling_info.get('surprisal_at_cut', 'N/A')
+            print(f"    -> BANDIT+SURPRISAL: sampled_bin={sampled_bin_idx}, local_idx={local_idx}, global_idx={idx}")
+            print(f"       Surprisal at cut: {surp_val}")
+        
+        return idx, sampling_info
+    
+    def update_on_accept(self, global_idx, log_r, sampled_bin_idx=None, p_bin=None):
+        """
+        Update state after an accepted proposal.
+        
+        CRITICAL FIX: 
+        - Uses GLOBAL coordinates for refractory center
+        - Uses sampled_bin_idx (not recomputed) for bandit update
+        
+        Args:
+            global_idx: GLOBAL index of the accepted cut point
+            log_r: Log acceptance ratio
+            sampled_bin_idx: The bin index that was SAMPLED (not recomputed)
+            p_bin: Bin probability distribution used (if available)
+        """
+        old_refractory = self.last_accepted_global_idx
+        self.last_accepted_global_idx = global_idx  # Store in GLOBAL coordinates
+        
+        # Compute reward (binary or clipped log_r)
+        reward = 1.0  # Binary reward for acceptance
+        
+        # CRITICAL FIX: Use sampled_bin_idx directly, don't recompute from position
+        if sampled_bin_idx is not None and p_bin is not None:
+            self.bandit.update(sampled_bin_idx, reward, p_bin, verbose_step=self.verbose)
+            if self.verbose:
+                print(f"    [Bandit Update] Using sampled_bin_idx={sampled_bin_idx} (not recomputed)")
+        
+        if self.verbose:
+            print(f"    [ACCEPTED] log_r={log_r:.4f}, exp(log_r)={np.exp(min(log_r, 700)):.4f}")
+            print(f"      Refractory center (GLOBAL): {old_refractory} -> {global_idx}")
+    
+    def update_on_reject(self, global_idx, log_r, sampled_bin_idx=None, p_bin=None):
+        """
+        Update state after a rejected proposal.
+        
+        IMPORTANT NOTE: With reward=0, EXP3 weights don't change (exp(0)=1).
+        This update is for statistics tracking only.
+        
+        Args:
+            global_idx: GLOBAL index of the rejected cut point
+            log_r: Log acceptance ratio
+            sampled_bin_idx: The bin index that was SAMPLED
+            p_bin: Bin probability distribution used (if available)
+        """
+        # IMPORTANT: With R=0, w_b *= exp(0) = 1, so weights don't change
+        # This is for statistics tracking only
+        if sampled_bin_idx is not None and p_bin is not None:
+            self.bandit.update(sampled_bin_idx, 0.0, p_bin, verbose_step=self.verbose)
+            if self.verbose:
+                print(f"    [Bandit Update] Reject with R=0 (weights unchanged), sampled_bin_idx={sampled_bin_idx}")
+        
+        if self.verbose:
+            print(f"    [REJECTED] log_r={log_r:.4f}, exp(log_r)={np.exp(min(log_r, 700)):.4f}")
+    
+    def end_block(self, block_idx=None):
+        """
+        Called at the end of each block to apply weight decay.
+        """
+        if self.verbose:
+            print(f"\n  [Block {block_idx} End] Applying weight decay...")
+        self.bandit.apply_decay()
+        
+        if self.verbose:
+            stats = self.get_stats()
+            print(f"    Current acceptance rates per bin: {np.round(stats['bandit_stats']['acceptance_rates'], 3).tolist()}")
+            print(f"    Total attempts: {self.total_samples}, Exploration: {self.exploration_samples} ({stats['exploration_rate']:.1%})")
+            print(f"    Last accepted global idx: {self.last_accepted_global_idx}")
+    
+    def reset(self):
+        """
+        Reset the sampler state for a new sequence.
+        """
+        if self.verbose:
+            print("\n[AdaptiveCutPointSampler] Resetting state for new sequence...")
+        self.bandit = BinBandit(
+            num_bins=self.num_bins,
+            gamma=self.bandit.gamma,
+            eta=self.bandit.eta,
+            decay=self.bandit.decay,
+            verbose=self.verbose
+        )
+        self.last_accepted_global_idx = None  # Reset to global coordinates
+        self.total_samples = 0
+        self.exploration_samples = 0
+    
+    def get_stats(self):
+        """Return statistics about the adaptive sampler."""
+        return {
+            'bandit_stats': self.bandit.get_stats(),
+            'total_samples': self.total_samples,
+            'exploration_samples': self.exploration_samples,
+            'exploration_rate': self.exploration_samples / max(1, self.total_samples),
+            'last_accepted_global_idx': self.last_accepted_global_idx  # Global coordinates
+        }
+
+
+# =============================================================================
+# EXISTING UTILITY FUNCTIONS (unchanged)
+# =============================================================================
+
+def print_full_tokens(tokenizer, ids, title=""):
+    """
+    ids: 1D torch tensor on CPU (dtype long), e.g. [seq_len]
+    """
+    ids_list = ids.tolist()
+    toks = tokenizer.convert_ids_to_tokens(ids_list)
+
+    if title:
+        print(f"\n===== {title} =====")
+    print(f"Total tokens: {len(ids_list)}")
+
+    # 1) Print full text (including prompt + completion)
+    full_text = tokenizer.decode(ids_list, skip_special_tokens=False)
+    print("\n[Full decoded text]")
+    print(full_text)
+
+    # 2) Print each token (with id)
+    print("\n[Token list: index | id | token]")
+    for i, (tid, tok) in enumerate(zip(ids_list, toks)):
+        print(f"{i:04d} | {tid:>6d} | {tok}")
+
 
 def plot_surprisal_timeline_matplotlib(
     surprisal_scores,
@@ -49,7 +691,9 @@ def plot_surprisal_timeline_matplotlib(
     save_path=None,
     window_size=5,
     peak_distance=10,
-    peak_prominence=0.3
+    peak_prominence=0.3,
+    bandit_stats=None,
+    sampling_info=None
 ):
     """
     Plot cognitive load / surprisal timeline using matplotlib.
@@ -68,8 +712,11 @@ def plot_surprisal_timeline_matplotlib(
         window_size: Window size for smoothing
         peak_distance: Minimum distance between peaks
         peak_prominence: Minimum prominence for peak detection
+        bandit_stats: Statistics from the bin-bandit (optional)
+        sampling_info: Information about how the cut point was sampled (optional)
     """
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    n_plots = 4 if bandit_stats is not None else 3
+    fig, axes = plt.subplots(n_plots, 1, figsize=(14, 3.5 * n_plots), sharex=False)
     
     steps = np.arange(len(surprisal_scores))
     
@@ -118,7 +765,13 @@ def plot_surprisal_timeline_matplotlib(
                         ha='center', fontsize=8, rotation=45)
     
     ax1.set_ylabel('Surprisal Score', fontsize=11)
-    ax1.set_title(f'Block {step_num} | MCMC Step {mcmc_step} | Accepted: {accepted}', fontsize=12, fontweight='bold')
+    
+    # Build title with sampling info
+    title = f'Block {step_num} | MCMC Step {mcmc_step} | Accepted: {accepted}'
+    if sampling_info:
+        method = sampling_info.get('method', 'unknown')
+        title += f' | Method: {method}'
+    ax1.set_title(title, fontsize=12, fontweight='bold')
     ax1.legend(loc='upper right', fontsize=9)
     ax1.grid(True, alpha=0.3)
     
@@ -159,6 +812,29 @@ def plot_surprisal_timeline_matplotlib(
     ax3.legend(loc='upper right', fontsize=9)
     ax3.grid(True, alpha=0.3)
     
+    # ===== Plot 4: Bandit Weights (if available) =====
+    if bandit_stats is not None and n_plots > 3:
+        ax4 = axes[3]
+        
+        weights = bandit_stats['weights']
+        acceptance_rates = bandit_stats['acceptance_rates']
+        num_bins = len(weights)
+        
+        x = np.arange(num_bins)
+        width = 0.35
+        
+        bars1 = ax4.bar(x - width/2, weights / np.max(weights), width, 
+                       label='Normalized Weights', color='#9467bd', alpha=0.8)
+        bars2 = ax4.bar(x + width/2, acceptance_rates, width,
+                       label='Acceptance Rate', color='#d62728', alpha=0.8)
+        
+        ax4.set_xlabel('Bin Index', fontsize=11)
+        ax4.set_ylabel('Value', fontsize=11)
+        ax4.set_title('Bin-Bandit Statistics', fontsize=11)
+        ax4.set_xticks(x)
+        ax4.legend(loc='upper right', fontsize=9)
+        ax4.grid(True, alpha=0.3, axis='y')
+    
     plt.tight_layout()
     
     if save_path:
@@ -182,7 +858,9 @@ def plot_surprisal_timeline_plotly(
     save_path=None,
     window_size=5,
     peak_distance=10,
-    peak_prominence=0.3
+    peak_prominence=0.3,
+    bandit_stats=None,
+    sampling_info=None
 ):
     """
     Plot cognitive load / surprisal timeline using Plotly (interactive).
@@ -191,7 +869,8 @@ def plot_surprisal_timeline_plotly(
         return plot_surprisal_timeline_matplotlib(
             surprisal_scores, entropy, velocities, tokens_text,
             context_len, current_idx, step_num, mcmc_step, accepted,
-            save_path, window_size, peak_distance, peak_prominence
+            save_path, window_size, peak_distance, peak_prominence,
+            bandit_stats, sampling_info
         )
     
     steps = np.arange(len(surprisal_scores))
@@ -202,11 +881,17 @@ def plot_surprisal_timeline_plotly(
     # Detect peaks
     peaks, _ = find_peaks(smoothed_surprisal, distance=peak_distance, prominence=peak_prominence)
     
+    # Determine number of rows
+    n_rows = 4 if bandit_stats is not None else 3
+    subplot_titles = ['Cognitive Load (Surprisal)', 'Entropy', 'Velocity']
+    if bandit_stats is not None:
+        subplot_titles.append('Bin-Bandit Statistics')
+    
     # Create subplots
     fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        subplot_titles=('Cognitive Load (Surprisal)', 'Entropy', 'Velocity'),
+        rows=n_rows, cols=1,
+        shared_xaxes=False,
+        subplot_titles=subplot_titles,
         vertical_spacing=0.08
     )
     
@@ -215,7 +900,7 @@ def plot_surprisal_timeline_plotly(
     generation_color = 'rgba(173, 216, 230, 0.3)'
     cut_color = 'rgba(255, 182, 193, 0.3)'
     
-    for row in range(1, 4):
+    for row in range(1, 4):  # First 3 plots share the same x-axis structure
         # Prompt region
         if context_len > 0:
             fig.add_vrect(x0=0, x1=context_len, fillcolor=prompt_color,
@@ -275,17 +960,49 @@ def plot_surprisal_timeline_plotly(
         row=3, col=1
     )
     
+    # Plot 4: Bandit statistics (if available)
+    if bandit_stats is not None:
+        weights = bandit_stats['weights']
+        acceptance_rates = bandit_stats['acceptance_rates']
+        num_bins = len(weights)
+        
+        fig.add_trace(
+            go.Bar(x=list(range(num_bins)), 
+                   y=weights / np.max(weights),
+                   name='Normalized Weights',
+                   marker_color='#9467bd',
+                   opacity=0.8),
+            row=4, col=1
+        )
+        
+        fig.add_trace(
+            go.Bar(x=list(range(num_bins)),
+                   y=acceptance_rates,
+                   name='Acceptance Rate',
+                   marker_color='#d62728',
+                   opacity=0.8),
+            row=4, col=1
+        )
+        
+        fig.update_xaxes(title_text="Bin Index", row=4, col=1)
+        fig.update_yaxes(title_text="Value", row=4, col=1)
+    
     # Update layout
     accept_str = "✓ Accepted" if accepted else ("✗ Rejected" if accepted is False else "N/A")
+    method_str = ""
+    if sampling_info:
+        method_str = f" | Method: {sampling_info.get('method', 'unknown')}"
+    
     fig.update_layout(
         title=dict(
-            text=f"<b>Block {step_num} | MCMC Step {mcmc_step} | {accept_str}</b>",
+            text=f"<b>Block {step_num} | MCMC Step {mcmc_step} | {accept_str}{method_str}</b>",
             x=0.5, font=dict(size=16)
         ),
-        height=800,
+        height=250 * n_rows,
         showlegend=True,
         template='plotly_white',
-        hovermode='x unified'
+        hovermode='x unified',
+        barmode='group'
     )
     
     fig.update_xaxes(title_text="Token Position", row=3, col=1)
@@ -313,6 +1030,10 @@ def compute_surprisal(entropy, velocities, window=5):
     # 1. Validation
     if len(entropy) != len(velocities):
         raise ValueError(f"Input lengths mismatch! Entropy: {len(entropy)}, Velocities: {len(velocities)}")
+    
+    # Handle empty input
+    if len(entropy) == 0:
+        return []
     
     # 2. Create DataFrame
     df = pd.DataFrame({
@@ -345,31 +1066,20 @@ def compute_surprisal(entropy, velocities, window=5):
     # 6. Return as simple list
     return df["Smoothed_Score"].tolist()
 
-### DESCRIPTION ###
-# power sampling to sample from p^{alpha}, where p is the base model
-# takes in 1/alpha (temperature) as an argument (default 0.25), and mcmc_power_samp implements sampling from p^{alpha} 
 
-# The AutoregressiveSampler is a safety wrapper. 
-# It ensures you don't feed the model too much text (crashing it), 
-# and it extracts the specific probability distribution for the next word, 
-# ready for a sampling strategy (like Greedy, Temperature, or Nucleus sampling) 
-# to actually choose the word.
+# =============================================================================
+# AUTOREGRESSIVE SAMPLER (unchanged)
+# =============================================================================
+
 class AutoregressiveSampler:
     def __init__(self, model, tokenizer, device):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.block_size = self.model.config.max_position_embeddings
-        # Context Limit: Every LLM has a hard limit on how much text 
-        # it can read at once (e.g., 2048 or 4096 tokens).
-        # The code extracts this limit (max_position_embeddings) 
-        # and saves it as block_size so the sampler knows when to cut off old text.
 
-    # returns log probs
-    @torch.no_grad()# This turns off the "learning" mode (gradient calculation). This drastically reduces memory usage and speeds up the code since we are only generating, not training.
+    @torch.no_grad()
     def next_token(self, prefix):
-      # Input: 'prefix' is a List of Integers (token IDs) representing the text written so far.
-      # Output: A 1D Tensor of Log-Probabilities for the NEXT token.
         device = self.device
         torch_prefix = torch.tensor([prefix], dtype=torch.long, device=device)
         prefix_cond = torch_prefix if torch_prefix.size(1) <= self.block_size else torch_prefix[:, -self.block_size:]
@@ -380,33 +1090,26 @@ class AutoregressiveSampler:
         return torch.log(probs)
 
 
+# =============================================================================
+# HELPER FUNCTIONS (unchanged)
+# =============================================================================
 
-# returns probabilities (normed)
 def normalize(dist):
     probs = F.softmax(dist, dim=-1)
     return probs
 
-# returns sum of logits (product of distributions p*q)
 def dist_product(logit_p, logit_q):
     return logit_p+logit_q
 
-# returns logit scaled by temp (temperature scaling p^(1/tau))
 def dist_temp_scale(logit_p, temp):
     return logit_p * torch.tensor(1 / temp, dtype=logit_p.dtype, device=logit_p.device)
 
-# low-temperature sampling proposal distribution
+
 def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
     c = len(context)
-    # 1. SETUP & INITIALIZATION
-    # Calculate the length of the prompt (context) so we know where to start reading the answer.
-
     device = p.device
     tokenizer = p.tokenizer
-    # Get the hardware device (GPU/CPU) and tokenizer from the sampler object.
-
     input_ids = torch.tensor([context], dtype=torch.long, device=device)
-    # Convert the Python list context into a PyTorch Tensor on the correct device.
-    # We add an extra dimension [context] -> [[...]] because the model expects a Batch dimension.
     
     output = p.model.generate(
         input_ids=input_ids,
@@ -418,78 +1121,45 @@ def naive_temp(p : AutoregressiveSampler, context, temp, seq_len):
         return_dict_in_generate=True,
         output_scores=True,
         output_logits=True,
-        output_hidden_states=True,  # <--- NEW: Request hidden states
+        output_hidden_states=True,
     )
-    # 3. PROCESS LOGITS (Existing Logic)
-    # output.logits is a tuple of tensors. We stack them to get shape (Seq_Len, Batch, Vocab)
+    
     unscaled_logits = torch.stack(output.logits, dim=0)
     scaled_logits = torch.stack(output.scores, dim=0)
     
-    # Get the generated tokens (removing the prompt)
     tokens = output.sequences[0][c:]
     prop = output.sequences[0].tolist()
 
-    # Integrity Check
     assert len(tokens) == unscaled_logits.shape[0] == scaled_logits.shape[0]
 
-    # Calculate Log Probs (Existing Logic)
-    # Reshape tokens to (Seq, 1, 1) for gathering from the logits tensor
     idx = tokens.view(unscaled_logits.shape[0], 1, 1)
 
     log_probs_unnorm = (1/temp * torch.gather(F.log_softmax(unscaled_logits, dim=-1), -1, idx)).view(-1).tolist()
     log_probs_norm = torch.gather(F.log_softmax(scaled_logits, dim=-1), -1, idx).view(-1).tolist()
 
-    # --- NEW LOGIC START ---
-
-    # ... inside naive_temp function ...
-
-    # 4. PROCESS HIDDEN STATES (h_last)
-    # output.hidden_states is a tuple (one item per generated token).
-    # Each item is a tuple of layers. We want the LAST layer (-1).
-    
     h_last_steps = []
     for step_tup in output.hidden_states:
-        # Get the tensor for the last layer
-        last_layer_tensor = step_tup[-1] # Shape could be [1, 72, 3584] or [1, 1, 3584]
-        
-        # We always want the LAST token's state from that step
-        # [:, -1, :] converts [1, 72, 3584] -> [1, 3584]
-        #            converts [1, 1, 3584]  -> [1, 3584]
+        last_layer_tensor = step_tup[-1]
         last_token_state = last_layer_tensor[:, -1, :]  
-        
         h_last_steps.append(last_token_state)
     
-    # Now all tensors are [Batch, Hidden], so we can stack them
-    h_last_stacked = torch.stack(h_last_steps, dim=0) # Shape: [Seq_Len, Batch, Hidden]
-    
-    # Squeeze to remove batch dim (assuming batch=1) -> (Seq_Len, Hidden_Size)
+    h_last_stacked = torch.stack(h_last_steps, dim=0)
     h_last = h_last_stacked.squeeze(1).cpu()
 
-  
-
-    # 5. CALCULATE ENTROPY
-    # Entropy measures the uncertainty of the model: H(x) = - sum(p(x) * log(p(x)))
-    # We use 'unscaled_logits' to measure the BASE model's uncertainty (ignoring temperature).
-    
     probs = F.softmax(unscaled_logits, dim=-1)
     log_probs = F.log_softmax(unscaled_logits, dim=-1)
-    
-    # Calculate entropy for each token step
-    entropy_tensor = -torch.sum(probs * log_probs, dim=-1) # Shape: (Seq_Len, Batch)
-    
-    # Flatten and convert to list
+    entropy_tensor = -torch.sum(probs * log_probs, dim=-1)
     entropy = entropy_tensor.view(-1).tolist()
 
-    # --- NEW LOGIC END ---
-
-    # Final Integrity Check
     assert len(tokens) == len(log_probs_unnorm) == len(log_probs_norm) == len(entropy) == h_last.size(0)
 
-    # Return prop (list), log_probs (lists), h_last (Tensor), entropy (list)
     return prop, log_probs_norm, log_probs_unnorm, h_last, entropy
 
 
-# alpha = infty power sampling; temp is for proposal distribution
+# =============================================================================
+# ORIGINAL MCMC FUNCTIONS (kept for backward compatibility)
+# =============================================================================
+
 def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_tokens, block_num=16):
     c = len(context)
     print(f'Temp: {temp}')
@@ -499,14 +1169,12 @@ def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_token
     log_probs_norm = []
     log_probs_unnorm = []
 
-
     print(max_new_tokens)
     assert max_new_tokens % block_num == 0
     jump_size = int(max_new_tokens // block_num)
     print(jump_size)
     attempts = 0
     acceptances = 0
-
 
     for _ in tqdm(range(block_num)):
         gen, lp_norm, lp_unnorm,h_last, entropy = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
@@ -517,7 +1185,6 @@ def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_token
             attempts+=1
             t = len(gen)
             idx = random.randint(c, t-1)
-            # llm query takes the burden of time
             prop, log_prob_prop, target_log_prob_prop,prop_h_last, prop_entropy = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
             s = len(prop)
             assert(len(log_prob_prop) == s - idx)
@@ -547,7 +1214,7 @@ def max_swap(p : AutoregressiveSampler, context, temp, mcmc_steps, max_new_token
     acceptance_ratio = acceptances/attempts
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
-# power sampling with autoregressive mcmc
+
 def mcmc_power_samp(
   p : AutoregressiveSampler, 
   context, 
@@ -556,30 +1223,18 @@ def mcmc_power_samp(
   max_new_tokens, 
   block_num=16
   ):
+    """Original random-cut MCMC (kept for backward compatibility and comparison)."""
     c = len(context)
-    # 1. SETUP & INITIALIZATION
-    # Calculate the length of the initial prompt (context) so we know 
-    # where the "user text" ends and "AI text" begins.
     print(f'alpha: {1/temp}')
     gen = []
-    # Initialize the list that will hold our generated token IDs.
     if context is not None:
         gen = context.copy()
     log_probs_norm = []
     log_probs_unnorm = []
-    # If the user provided a prompt (context),
-    # copy it into our generation buffer to start.
-    # Initialize empty lists to store the probability scores of the tokens we generate.
-    # 'norm' = Normalized Log Probabilities (Proposal Distribution Q).
-    # 'unnorm' = Unnormalized Log Probabilities (Target Distribution P).
 
-    # [NEW] Lists to store the history of the entire generated sequence
-    # We only track metrics for the *generated* part (after context 'c')
     full_entropy = [] 
-    full_h_last = torch.tensor([], device='cpu') # Initialize empty tensor
+    full_h_last = torch.tensor([], device='cpu')
 
-    # 2. BLOCK PLANNING
-    # Print total tokens to generate (debugging info).
     print(max_new_tokens)
     assert max_new_tokens % block_num == 0
     jump_size = int(max_new_tokens // block_num)
@@ -588,136 +1243,59 @@ def mcmc_power_samp(
     attempts = 0
     acceptances = 0
 
-    # 3. OUTER LOOP (The "Writer")
-    # This loop runs 16 times (block_num). Each time, 
-    # it extends the story by 'jump_size' tokens.
     for _ in tqdm(range(block_num)):
         gen, lp_norm, lp_unnorm,h_last, entropy = naive_temp(p, gen, temp=temp, seq_len=jump_size+len(gen))
         log_probs_norm.extend(lp_norm)
         log_probs_unnorm.extend(lp_unnorm)
-        # 方案：利用切片错位计算 (Vectorized)
-        # h_last[:-1] 是从第 0 个到倒数第 2 个
-        # h_last[1:]  是从第 1 个到最后 1 个
-        # dim=-1 表示在向量维度上计算相似度
-
+        
         sims = F.cosine_similarity(h_last[:-1], h_last[1:], dim=-1)
         velocities = (1 - sims).tolist() + [0.0]
-        print(f"raw_h_last shape: {h_last.shape}")   # Tensor 用 .shape
-        print(f"Entropy length: {len(entropy)}")      # List 用 len()
-        print(f"Velocities length: {len(velocities)}") # List 用 len()
+        print(f"raw_h_last shape: {h_last.shape}")
+        print(f"Entropy length: {len(entropy)}")
+        print(f"Velocities length: {len(velocities)}")
         surprisal_scores = compute_surprisal(entropy, velocities)
 
         for _ in tqdm(range(mcmc_steps)):
             attempts+=1
-            # Increment the attempt counter.
             t = len(gen)
-            # Get the current total length of our text.
-
-
             idx = random.randint(c, t-1)
-            # Pick a RANDOM CUT POINT ('idx').
-            # We ensure it is after the prompt ('c') but before the end of the text ('t-1').
-            # We are going to try to rewrite everything that comes AFTER this point.
-            # llm query takes the burden of time
-
-            # 5. GENERATE PROPOSAL (The Rewrite)
+            
             prop, log_prob_prop, target_log_prob_prop,prop_h_last, prop_entropy = naive_temp(p, gen[:idx], temp=temp, seq_len=t)
             
-            # Take the text up to the cut point (gen[:idx]) and ask the model to generate a NEW ending
-            # that reaches the same length 't'.
-            # 'prop' = The new proposed text sequence.
-            # 'log_prob_prop' = The probabilities of this new ending (Proposal Q).
-            # 'target_log_prob_prop' = The target probabilities of this new ending (Target P).
-            
             s = len(prop)
-            # Get the length of the new proposal (should be same as 't').
             assert(len(log_prob_prop) == s - idx)
             assert(len(target_log_prob_prop) == s - idx)
-            # Safety Checks: Ensure the probability lists match 
-            # the length of the new segment we generated.
 
-            # 6. GATHER DATA FOR COMPARISON
             log_prob_cur = log_probs_norm.copy()[idx-c:s-c]
             target_log_prob_cur = log_probs_unnorm.copy()[idx-c:s-c]
-            # Extract the probability scores of the CURRENT (Old) text segment that we might replace.
-            # We need these to calculate if the new version is better than the old version.
            
-            # 7. CALCULATE METROPOLIS-HASTINGS RATIO
             log_r = sum(target_log_prob_prop) + sum(log_prob_cur) - sum(target_log_prob_cur) - sum(log_prob_prop)
-            # This formula decides if we accept the change.
-            # log_r = log(P_new) + log(Q_old|new) - log(P_old) - log(Q_new|old)
-            # Roughly: (How good is the new text?) - (How good was the old text?)
-            # More detailed explaination:
-            #####################################
-            # We need to decide if the New Proposal ('prop') is better than the Current Text ('cur').
-            # The formula is: log_r = (New Quality - Old Quality) + (Old Luck - New Luck)
             
-            # PART A: The Quality Check (Target P)
-            # sum(target_log_prob_prop): How much the model *loves* the new answer (The "Energy").
-            # sum(target_log_prob_cur):  How much the model *loved* the old answer.
-            # If (New - Old) is positive, the new answer is mathematically "smarter".
-            
-            # PART B: The Luck Correction (Proposal Q)
-            # sum(log_prob_prop): How "easy" it was to generate this text randomly (Bias).
-            # We subtract this to penalize answers that are just "lucky" or common, 
-            # ensuring we favor answers that are truly intelligent, not just probable.
-            
-            # Formula: log(P_new) + log(Q_old|new) - log(P_old) - log(Q_new|old)
-            # More detailed explaination:
-            #####################################
-            # 8. THE DECISION
-            # Generate a random number between 0 and 1.
-            # If it is less than exp(log_r), we ACCEPT the proposal.
-            # This allows us to always accept better answers, but sometimes accept worse ones (to explore).
-            # 
-            # We convert the log score back to a probability: np.exp(log_r).
-            # Then we compare it against a random coin flip (0 to 1).
-            
-            # Case 1: New answer is BETTER (log_r > 0) -> exp(log_r) > 1.
-            #         We ALWAYS accept (since random number is always < 1).
-            
-            # Case 2: New answer is WORSE (log_r < 0) -> exp(log_r) is a decimal (e.g., 0.3).
-            #         We accept it ONLY if the random coin flip is low (30% chance).
-            #         This "exploration" allows the model to escape bad reasoning traps.
             if np.random.rand() < np.exp(log_r):
                 acceptances+=1
-                # We accepted! Increment the counter.
-
                 gen = prop.copy()
-                # Overwrite the main sequence 'gen' with the new proposal 'prop'.
-
-
                 log_probs_norm[idx-c:] = log_prob_prop.copy()
                 log_probs_unnorm[idx-c:] = target_log_prob_prop.copy()
-                # Update our probability logs to match the new text.
-                # We slice [idx-c:] because we only changed the text after the cut point.
 
                 del prop
                 del log_prob_prop
                 del target_log_prob_cur
-                # Clean up memory (delete variables we don't need anymore).
 
-        # 9. CHECK FOR COMPLETION (EOS)
-        # After every block, check if the model wrote the "End of Sentence" token.
         if p.tokenizer.eos_token_id in gen:
             eos_idx = gen.index(p.tokenizer.eos_token_id)
-            # Find exactly where the EOS token is.
-
             gen = gen[:eos_idx + 1]
             log_probs_norm = log_probs_norm[:eos_idx + 1]
             log_probs_unnorm = log_probs_unnorm[:eos_idx + 1]
-            # Cut off the text and logs right at the EOS token (discard anything after it).
-            
             acceptance_ratio = acceptances/attempts
-            # Calculate the final acceptance ratio.
-
             return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
-            # Return the final result immediately (exit the function).
 
-    # 10. FINAL RETURN
-    # If we finished all blocks without seeing an EOS token, return what we have.        
     acceptance_ratio = acceptances/attempts
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
+
+
+# =============================================================================
+# NEW: ADAPTIVE CUT-POINT MCMC WITH PLOTTING
+# =============================================================================
 
 def mcmc_power_samp_with_plot(
     p,  # AutoregressiveSampler
@@ -726,16 +1304,31 @@ def mcmc_power_samp_with_plot(
     mcmc_steps,
     max_new_tokens,
     block_num=16,
-    plot_every=1,  # Plot every N MCMC steps
+    plot_every=1,
     save_plots=True,
     plot_dir="mcmc_plots",
     use_plotly=True,
     window_size=5,
     peak_distance=10,
-    peak_prominence=0.3
+    peak_prominence=0.3,
+    # NEW: Adaptive cut-point parameters
+    use_adaptive_cut=True,
+    adaptive_num_bins=10,
+    adaptive_delta=0.1,
+    adaptive_epsilon=0.1,
+    adaptive_refractory_radius=10,
+    adaptive_bandit_gamma=0.1,
+    adaptive_bandit_eta=0.1,
+    adaptive_bandit_decay=0.02,
+    verbose=True  # Whether to print detailed logging
 ):
     """
-    MCMC Power Sampling with integrated surprisal timeline visualization.
+    MCMC Power Sampling with integrated surprisal timeline visualization
+    and ADAPTIVE cut-point selection using bin-bandit with surprisal prior.
+    
+    NOTE: Window size (L) is DYNAMICALLY determined as L = seq_len - context_len,
+    i.e., the entire generated region. The number of bins (B) is fixed,
+    and bin_size (K = L/B) adapts automatically to the current window.
     
     Args:
         p: AutoregressiveSampler instance
@@ -748,9 +1341,20 @@ def mcmc_power_samp_with_plot(
         save_plots: Whether to save plots to disk
         plot_dir: Directory to save plots
         use_plotly: Use Plotly for interactive plots (else matplotlib)
-        window_size: Window size for surprisal smoothing
+        window_size: Window size for surprisal smoothing (for visualization only)
         peak_distance: Minimum distance between detected peaks
         peak_prominence: Minimum prominence for peak detection
+        
+        # Adaptive cut-point parameters:
+        use_adaptive_cut: Whether to use adaptive cut-point selection (default True)
+        adaptive_num_bins: Number of bins B for the bandit (fixed, bin size adapts)
+        adaptive_delta: Mix factor for surprisal prior with uniform
+        adaptive_epsilon: Probability of forced uniform exploration
+        adaptive_refractory_radius: Radius W for anti-repeat masking
+        adaptive_bandit_gamma: Exploration rate for EXP3
+        adaptive_bandit_eta: Learning rate for EXP3 updates
+        adaptive_bandit_decay: Weight decay for non-stationarity
+        verbose: Whether to print detailed logging information
     
     Returns:
         gen: Generated token sequence
@@ -759,7 +1363,27 @@ def mcmc_power_samp_with_plot(
         acceptance_ratio: Ratio of accepted proposals
     """
     c = len(context)
-    print(f'alpha: {1/temp}')
+    
+    # Compute window size = jump_size = max_new_tokens // block_num
+    jump_size = max_new_tokens // block_num
+    
+    print(f"\n{'='*70}")
+    print(f"[MCMC Power Sampling] Starting...")
+    print(f"  Temperature: {temp} (alpha={1/temp})")
+    print(f"  MCMC steps per block: {mcmc_steps}")
+    print(f"  Blocks: {block_num}")
+    print(f"  Max new tokens: {max_new_tokens}")
+    print(f"  Jump size per block (= Window size L): {jump_size}")
+    print(f"  Adaptive cut-point: {use_adaptive_cut}")
+    if use_adaptive_cut:
+        base_bin_size = jump_size // adaptive_num_bins
+        remainder = jump_size % adaptive_num_bins
+        print(f"  Window size (L): {jump_size} = {adaptive_num_bins} bins")
+        print(f"  Base bin size (K): {base_bin_size}")
+        print(f"  Remainder: {remainder} (added to last bin)")
+        print(f"  Bin sizes: first {adaptive_num_bins-1} bins = {base_bin_size} tokens, last bin = {base_bin_size + remainder} tokens")
+    print(f"  Verbose logging: {verbose}")
+    print(f"{'='*70}\n")
     
     # Create plot directory
     if save_plots:
@@ -772,20 +1396,48 @@ def mcmc_power_samp_with_plot(
     log_probs_norm = []
     log_probs_unnorm = []
     
-    # Storage for trajectory data
-    full_entropy = []
-    full_h_last = torch.tensor([], device='cpu')
+    # ========== FIX Issue 1: Maintain FULL surprisal array for entire generation ==========
+    # These arrays track surprisal-related metrics for ALL generated tokens (positions c to t)
+    # When MH accepts, we update only the rewritten slice [idx-c : t-c]
+    full_entropy = []       # Length = t - c (number of generated tokens)
+    full_velocities = []    # Length = t - c
+    full_surprisal = []     # Length = t - c (computed from entropy + velocities)
+    full_h_last = None      # Hidden states for velocity computation
+    # ==================================================================================
     
-    print(max_new_tokens)
+    print(f"Context length: {c}")
+    print(f"Max new tokens: {max_new_tokens}")
     assert max_new_tokens % block_num == 0
-    jump_size = int(max_new_tokens // block_num)
-    print(jump_size)
+    print(f"Jump size per block: {jump_size}")
     
     attempts = 0
     acceptances = 0
     
+    # Initialize adaptive cut-point sampler with window_size = jump_size
+    if use_adaptive_cut:
+        cut_point_sampler = AdaptiveCutPointSampler(
+            window_size=jump_size,  # L = max_new_tokens // block_num
+            num_bins=adaptive_num_bins,
+            delta=adaptive_delta,
+            epsilon_explore=adaptive_epsilon,
+            refractory_radius=adaptive_refractory_radius,
+            bandit_gamma=adaptive_bandit_gamma,
+            bandit_eta=adaptive_bandit_eta,
+            bandit_decay=adaptive_bandit_decay,
+            verbose=verbose
+        )
+    else:
+        cut_point_sampler = None
+    
     # 3. OUTER LOOP (The "Writer")
     for block_idx in tqdm(range(block_num), desc="Blocks"):
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"[Block {block_idx}/{block_num}] Starting generation...")
+            print(f"  Current sequence length: {len(gen)}")
+            print(f"  Current full_surprisal length: {len(full_surprisal)}")
+            print(f"{'='*60}")
+        
         # Generate new tokens for this block
         gen, lp_norm, lp_unnorm, h_last, entropy = naive_temp(
             p, gen, temp=temp, seq_len=jump_size + len(gen)
@@ -794,15 +1446,31 @@ def mcmc_power_samp_with_plot(
         log_probs_unnorm.extend(lp_unnorm)
         
         # Compute velocities from hidden states
-        sims = F.cosine_similarity(h_last[:-1], h_last[1:], dim=-1)
-        velocities = (1 - sims).tolist() + [0.0]
+        if h_last.size(0) > 1:
+            sims = F.cosine_similarity(h_last[:-1], h_last[1:], dim=-1)
+            velocities = (1 - sims).tolist() + [0.0]
+        else:
+            velocities = [0.0] * len(entropy)
         
         print(f"raw_h_last shape: {h_last.shape}")
         print(f"Entropy length: {len(entropy)}")
         print(f"Velocities length: {len(velocities)}")
         
-        # Compute initial surprisal scores
-        surprisal_scores = compute_surprisal(entropy, velocities)
+        # ========== FIX Issue 1: Extend full arrays with new block data ==========
+        full_entropy.extend(entropy)
+        full_velocities.extend(velocities)
+        
+        # Compute surprisal for the new block and extend
+        block_surprisal = compute_surprisal(entropy, velocities)
+        full_surprisal.extend(block_surprisal)
+        
+        # Store h_last for potential velocity recomputation (we store the last hidden state)
+        # Note: For memory efficiency, we could store only the last hidden state for boundary calculation
+        full_h_last = h_last  # We'll use this for boundary velocity computation
+        
+        if verbose:
+            print(f"  Extended full arrays: entropy={len(full_entropy)}, velocities={len(full_velocities)}, surprisal={len(full_surprisal)}")
+        # ========================================================================
         
         # Get token texts for labeling
         tokens_text = [p.tokenizer.decode([tid]) for tid in gen]
@@ -811,9 +1479,63 @@ def mcmc_power_samp_with_plot(
         for mcmc_idx in tqdm(range(mcmc_steps), desc=f"MCMC (Block {block_idx})", leave=False):
             attempts += 1
             t = len(gen)
+            gen_len = t - c  # Number of generated tokens
             
-            # Random cut point
-            idx = random.randint(c, t - 1)
+            # ========== CUT-POINT SELECTION ==========
+            if use_adaptive_cut and cut_point_sampler is not None:
+                # Window covers trailing L tokens: [max(c, t-L), t)
+                # L = jump_size (stored in cut_point_sampler.window_size)
+                L = cut_point_sampler.window_size
+                window_start = max(c, t - L)
+                window_size = t - window_start
+                
+                # ========== FIX Issue 1: Use FULL surprisal array ==========
+                # full_surprisal has length = gen_len = t - c
+                # Window in generation coordinates: [window_start - c, gen_len)
+                # i.e., indices [window_start - c, t - c) in full_surprisal
+                if window_size > 0 and len(full_surprisal) > 0:
+                    # Extract the exact window slice from full_surprisal
+                    window_start_gen = window_start - c  # Convert to generation coordinates
+                    window_end_gen = gen_len  # = t - c
+                    
+                    # Safety check
+                    window_start_gen = max(0, window_start_gen)
+                    window_end_gen = min(len(full_surprisal), window_end_gen)
+                    
+                    window_surprisal = np.array(full_surprisal[window_start_gen:window_end_gen])
+                    
+                    if verbose:
+                        print(f"    [Surprisal Window] gen_coords=[{window_start_gen}, {window_end_gen}), "
+                              f"length={len(window_surprisal)}, expected={window_size}")
+                    
+                    # If window_surprisal is shorter than expected (shouldn't happen), pad
+                    if len(window_surprisal) < window_size:
+                        pad_size = window_size - len(window_surprisal)
+                        mean_val = np.mean(window_surprisal) if len(window_surprisal) > 0 else 1.0
+                        window_surprisal = np.concatenate([
+                            np.ones(pad_size) * mean_val,
+                            window_surprisal
+                        ])
+                        if verbose:
+                            print(f"    [WARNING] Padded surprisal from {window_size - pad_size} to {window_size}")
+                    
+                    idx, sampling_info = cut_point_sampler.sample_cut_point(
+                        context_len=c,
+                        seq_len=t,
+                        surprisal_scores=window_surprisal,
+                        mcmc_step=mcmc_idx,
+                        block_idx=block_idx
+                    )
+                # ==============================================================
+                else:
+                    idx = c
+                    sampling_info = {'method': 'edge_case', 'window_start': c, 'sampled_bin_idx': None}
+            else:
+                # Random cut point (original method)
+                idx = random.randint(c, t - 1)
+                sampling_info = {'method': 'random', 'idx': idx, 'window_start': c, 'sampled_bin_idx': None}
+                if verbose:
+                    print(f"\n  [Random Cut] Block={block_idx}, MCMC={mcmc_idx}, idx={idx}")
             
             # 5. GENERATE PROPOSAL
             prop, log_prob_prop, target_log_prob_prop, prop_h_last, prop_entropy = naive_temp(
@@ -833,15 +1555,48 @@ def mcmc_power_samp_with_plot(
                     sum(target_log_prob_cur) - sum(log_prob_prop))
             
             # 8. ACCEPTANCE DECISION
-            accepted = np.random.rand() < np.exp(log_r)
+            # IMPORTANT FIX: Use log-domain test for numerical stability
+            # log(u) < log_r is equivalent to u < exp(log_r) but overflow-safe
+            log_u = np.log(np.random.rand())
+            accepted = log_u < log_r
+            
+            if verbose:
+                print(f"    MH test: log_u={log_u:.4f}, log_r={log_r:.4f}, accepted={accepted}")
+            
+            # ========== BANDIT UPDATE (no extra model calls) ==========
+            if use_adaptive_cut and cut_point_sampler is not None:
+                # CRITICAL FIX: Use sampled_bin_idx directly (not recomputed)
+                sampled_bin_idx = sampling_info.get('sampled_bin_idx', None)
+                
+                # Get the bin probability used for this sample
+                p_bin = sampling_info.get('p_bin', None)
+                if p_bin is not None:
+                    p_bin = np.array(p_bin)
+                
+                # Pass GLOBAL idx for refractory center update
+                if accepted:
+                    cut_point_sampler.update_on_accept(idx, log_r, sampled_bin_idx, p_bin)
+                else:
+                    cut_point_sampler.update_on_reject(idx, log_r, sampled_bin_idx, p_bin)
+            elif verbose:
+                # Log for random cut method
+                if accepted:
+                    print(f"    [ACCEPTED] log_r={log_r:.4f}")
+                else:
+                    print(f"    [REJECTED] log_r={log_r:.4f}")
             
             # ========== PLOTTING SECTION ==========
             if mcmc_idx % plot_every == 0:
-                # Compute current surprisal for visualization
-                current_entropy = list(entropy)  # Current entropy values
-                current_velocities = list(velocities)  # Current velocity values
-                current_surprisal = compute_surprisal(current_entropy, current_velocities)
+                # Use full arrays for visualization (not just current block)
+                current_entropy = list(full_entropy)
+                current_velocities = list(full_velocities)
+                current_surprisal = list(full_surprisal)
                 current_tokens = [p.tokenizer.decode([tid]) for tid in gen]
+                
+                # Get bandit stats if available
+                bandit_stats = None
+                if use_adaptive_cut and cut_point_sampler is not None:
+                    bandit_stats = cut_point_sampler.bandit.get_stats()
                 
                 # Determine save path
                 if save_plots:
@@ -873,7 +1628,9 @@ def mcmc_power_samp_with_plot(
                         save_path=save_path,
                         window_size=window_size,
                         peak_distance=peak_distance,
-                        peak_prominence=peak_prominence
+                        peak_prominence=peak_prominence,
+                        bandit_stats=bandit_stats,
+                        sampling_info=sampling_info
                     )
                 else:
                     plot_surprisal_timeline_matplotlib(
@@ -889,7 +1646,9 @@ def mcmc_power_samp_with_plot(
                         save_path=save_path,
                         window_size=window_size,
                         peak_distance=peak_distance,
-                        peak_prominence=peak_prominence
+                        peak_prominence=peak_prominence,
+                        bandit_stats=bandit_stats,
+                        sampling_info=sampling_info
                     )
             # ========== END PLOTTING SECTION ==========
             
@@ -899,19 +1658,73 @@ def mcmc_power_samp_with_plot(
                 log_probs_norm[idx - c:] = log_prob_prop.copy()
                 log_probs_unnorm[idx - c:] = target_log_prob_prop.copy()
                 
-                # Update entropy and velocities after acceptance
-                entropy = prop_entropy
-                prop_sims = F.cosine_similarity(prop_h_last[:-1], prop_h_last[1:], dim=-1)
-                velocities = (1 - prop_sims).tolist() + [0.0]
-                h_last = prop_h_last
+                # ========== FIX Issue 1: Update FULL arrays for rewritten suffix ==========
+                # The rewritten suffix covers generation coordinates [idx - c, t - c)
+                # We update only this slice in full_entropy, full_velocities, full_surprisal
                 
-                # Recompute surprisal scores
-                surprisal_scores = compute_surprisal(entropy, velocities)
+                rewrite_start = idx - c  # Start of rewritten region in generation coordinates
+                rewrite_end = len(gen) - c  # End of rewritten region (= new gen_len)
+                
+                # prop_entropy covers the rewritten suffix (length = t - idx)
+                prop_entropy_list = list(prop_entropy)
+                
+                # Compute velocities for the rewritten suffix from prop_h_last
+                # NOTE: prop_h_last has shape [t - idx, hidden_dim] (only the new suffix)
+                # The velocity at the boundary (between old token idx-1 and new token idx)
+                # cannot be computed without storing all hidden states. We accept this
+                # approximation - the first velocity in the suffix is between new tokens 0 and 1.
+                if prop_h_last.size(0) > 1:
+                    prop_sims = F.cosine_similarity(prop_h_last[:-1], prop_h_last[1:], dim=-1)
+                    prop_velocities = (1 - prop_sims).tolist() + [0.0]
+                else:
+                    prop_velocities = [0.0] * len(prop_entropy_list)
+                
+                # Compute surprisal for the rewritten suffix using prop_entropy and prop_velocities
+                prop_surprisal = compute_surprisal(prop_entropy_list, prop_velocities)
+                
+                if verbose:
+                    print(f"    [MH Accept] Computing new surprisal from prop_h_last and prop_entropy:")
+                    print(f"      prop_h_last shape: {prop_h_last.shape}")
+                    print(f"      prop_entropy length: {len(prop_entropy_list)}")
+                    print(f"      prop_velocities length: {len(prop_velocities)}")
+                    print(f"      prop_surprisal length: {len(prop_surprisal)}")
+                
+                # Verify lengths match
+                assert len(prop_entropy_list) == len(prop_velocities) == len(prop_surprisal), \
+                    f"Length mismatch: entropy={len(prop_entropy_list)}, vel={len(prop_velocities)}, surp={len(prop_surprisal)}"
+                
+                # Update the full arrays - replace the rewritten slice
+                # full_xxx has length = current gen_len before update
+                # We replace [rewrite_start:] with the new suffix data
+                full_entropy[rewrite_start:] = prop_entropy_list
+                full_velocities[rewrite_start:] = prop_velocities
+                full_surprisal[rewrite_start:] = prop_surprisal
+                
+                if verbose:
+                    print(f"    [Full Arrays Updated] Replaced slice [{rewrite_start}:] with suffix of length {len(prop_entropy_list)}")
+                    print(f"      full_entropy length: {len(full_entropy)}")
+                    print(f"      full_velocities length: {len(full_velocities)}")
+                    print(f"      full_surprisal length: {len(full_surprisal)}")
+                    # Verify consistency
+                    expected_len = len(gen) - c
+                    if len(full_surprisal) != expected_len:
+                        print(f"      WARNING: Expected length {expected_len}, got {len(full_surprisal)}")
+                
+                # Also update the local variables for plotting
+                entropy = prop_entropy_list
+                velocities = prop_velocities
+                h_last = prop_h_last
+                # ===========================================================================
+                
                 tokens_text = [p.tokenizer.decode([tid]) for tid in gen]
                 
                 del prop
                 del log_prob_prop
                 del target_log_prob_cur
+        
+        # End of block: apply weight decay for non-stationarity
+        if use_adaptive_cut and cut_point_sampler is not None:
+            cut_point_sampler.end_block(block_idx=block_idx)
         
         # 9. CHECK FOR EOS
         if p.tokenizer.eos_token_id in gen:
@@ -920,19 +1733,37 @@ def mcmc_power_samp_with_plot(
             log_probs_norm = log_probs_norm[:eos_idx + 1]
             log_probs_unnorm = log_probs_unnorm[:eos_idx + 1]
             acceptance_ratio = acceptances / attempts
+            
+            # Print final statistics
+            if use_adaptive_cut and cut_point_sampler is not None:
+                stats = cut_point_sampler.get_stats()
+                print(f"\n=== Adaptive Cut-Point Statistics ===")
+                print(f"Total samples: {stats['total_samples']}")
+                print(f"Exploration samples: {stats['exploration_samples']} ({stats['exploration_rate']:.2%})")
+                print(f"Bandit weights: {stats['bandit_stats']['weights']}")
+                print(f"Bin acceptance rates: {stats['bandit_stats']['acceptance_rates']}")
+            
             return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
     
     # 10. FINAL RETURN
     acceptance_ratio = acceptances / attempts
+    
+    # Print final statistics
+    if use_adaptive_cut and cut_point_sampler is not None:
+        stats = cut_point_sampler.get_stats()
+        print(f"\n=== Adaptive Cut-Point Statistics ===")
+        print(f"Total samples: {stats['total_samples']}")
+        print(f"Exploration samples: {stats['exploration_samples']} ({stats['exploration_rate']:.2%})")
+        print(f"Bandit weights: {stats['bandit_stats']['weights']}")
+        print(f"Bin acceptance rates: {stats['bandit_stats']['acceptance_rates']}")
+    
     return gen, log_probs_norm, log_probs_unnorm, acceptance_ratio
 
 
-# This function is a Prompt Engineer's adapter. 
-# Its job is to take your raw math question and "dress it up" 
-# in the specific format that each different AI model expects to see.
-# Different models (like Qwen, Phi, or Tulu) require different formatting rules
-#—some want raw text, while others require a "Chat Template" (User/Assistant structure).
-# these PROMPT. COT, BASE are stored in constants.py
+# =============================================================================
+# PROMPT FORMATTING (unchanged)
+# =============================================================================
+
 def format_prompt(question, model, tokenizer, cot=True):
     if model == "qwen":
         format_str = PROMPT + question

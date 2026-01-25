@@ -41,21 +41,35 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", action = "store", default = 0.25, type = float, dest = "temperature")
     parser.add_argument("--dataset", action = "store", default = "MATH", type = str)
     parser.add_argument("--cot", action = "store", type = bool, default = True)
-    parser.add_argument("--mcmc_steps", action = "store", type = int, default = 10)
+    parser.add_argument("--mcmc_steps", action = "store", type = int, default = 3)
     parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)
     
-    # When you type this in your terminal:
-    # Bash
-    # --- python script.py --seed 42
-    # The parser sees the flag --seed.
-    # Because action="store", it looks at the next thing you typed (42).
-    # It takes that 42 and stores it inside the variable args.seed.
-    # Why do we need to specify it?
-    # Actually, "store" is the default behavior, so the programmer didn't 
-    # strictly need to write it there. They likely included it for clarity.
-    
+    # ===== NEW: Adaptive Cut-Point Selection Arguments =====
+    parser.add_argument("--use_adaptive_cut", action = "store_true", default = True,
+                        help = "Use adaptive cut-point selection (bin-bandit with surprisal prior)")
+    parser.add_argument("--no_adaptive_cut", action = "store_false", dest = "use_adaptive_cut",
+                        help = "Disable adaptive cut-point selection (use random cuts)")
+    parser.add_argument("--adaptive_num_bins", action = "store", type = int, default = 10,
+                        help = "Number of bins B for the bin-bandit (fixed, bin size adapts to window)")
+    parser.add_argument("--adaptive_delta", action = "store", type = float, default = 0.1,
+                        help = "Mix factor for surprisal prior with uniform distribution")
+    parser.add_argument("--adaptive_epsilon", action = "store", type = float, default = 0.1,
+                        help = "Probability of forced uniform exploration")
+    parser.add_argument("--adaptive_refractory_radius", action = "store", type = int, default = 10,
+                        help = "Radius W for anti-repeat refractory masking")
+    parser.add_argument("--adaptive_bandit_gamma", action = "store", type = float, default = 0.1,
+                        help = "Exploration rate gamma for EXP3 bandit")
+    parser.add_argument("--adaptive_bandit_eta", action = "store", type = float, default = 0.1,
+                        help = "Learning rate eta for EXP3 bandit weight updates")
+    parser.add_argument("--adaptive_bandit_decay", action = "store", type = float, default = 0.02,
+                        help = "Weight decay lambda for handling non-stationarity")
+    parser.add_argument("--verbose", action = "store_true", default = True,
+                        help = "Enable verbose logging during MCMC")
+    parser.add_argument("--no_verbose", action = "store_false", dest = "verbose",
+                        help = "Disable verbose logging")
+    # ===== END NEW ARGUMENTS =====
     
     args = parser.parse_args()
     # This line actually executes the parsing. 
@@ -88,6 +102,7 @@ if __name__ == "__main__":
     print(model)
     print(device)
     print(mcmc_steps)
+    print(f"Adaptive cut-point selection: {args.use_adaptive_cut}")
 
     # Just for the convenience of model selection.
     if model == "qwen":
@@ -196,6 +211,8 @@ if __name__ == "__main__":
         
         print(tokenizer.decode(naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("naive done")
+        naive_seq = naive_temp_output.sequences[0].detach().to("cpu")   # full: prompt + completion
+        print_full_tokens(tokenizer, naive_seq, title="NAIVE (full prompt+completion)")
         # EXPLANATION OF THE LINE ABOVE:
         # 1. THE SLICE (naive_temp_output[0][:, len(input_ids[0]):])
         #    The Problem: The model returns [Original Prompt + New Answer]. We don't want to print the question again.
@@ -220,10 +237,12 @@ if __name__ == "__main__":
         
         print(tokenizer.decode(std_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("std done")
+        std_seq = std_output.sequences[0].detach().to("cpu")            # full: prompt + completion
+        print_full_tokens(tokenizer, std_seq, title="STD (full prompt+completion)")
         # naive output: Uses temp (whatever you set in arguments).
         # std output: Uses 1.0 (The "Natural" state of the model).
 
-        #mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=3072)
+        # ===== MCMC WITH ADAPTIVE CUT-POINT SELECTION =====
         mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp_with_plot(
           autoreg_sampler,
           prefx,
@@ -238,6 +257,16 @@ if __name__ == "__main__":
           window_size=5,
           peak_distance=10,
           peak_prominence=0.3,
+          # Adaptive cut-point parameters (window size is now DYNAMIC)
+          use_adaptive_cut=args.use_adaptive_cut,
+          adaptive_num_bins=args.adaptive_num_bins,
+          adaptive_delta=args.adaptive_delta,
+          adaptive_epsilon=args.adaptive_epsilon,
+          adaptive_refractory_radius=args.adaptive_refractory_radius,
+          adaptive_bandit_gamma=args.adaptive_bandit_gamma,
+          adaptive_bandit_eta=args.adaptive_bandit_eta,
+          adaptive_bandit_decay=args.adaptive_bandit_decay,
+          verbose=args.verbose,
         )
 
         print(len(std_output))
@@ -275,35 +304,12 @@ if __name__ == "__main__":
             "std_answer": std_answer,
             "mcmc_completion": mcmc_completion,
             "mcmc_answer": mcmc_answer,
+            "acceptance_ratio": acceptance_ratio,
+            "use_adaptive_cut": args.use_adaptive_cut,
         })
 
     
+    # Build filename with adaptive cut info
+    adaptive_str = "adaptive" if args.use_adaptive_cut else "random"
     df = pd.DataFrame(results)
-    df.to_csv(os.path.join(save_str, model+"_math_base_power_samp_results_" + str(mcmc_steps) + "_" + str(temp) + "_" + str(args.batch_idx)  + "_" + str(args.seed) + ".csv"), index=False)
-    
-
-
-
-
-
-
-
-
-
-
-
-
-        
-
-
-
-
-
-
-
-
-
-
-
-
-
+    df.to_csv(os.path.join(save_str, model+"_math_base_power_samp_results_" + adaptive_str + "_" + str(mcmc_steps) + "_" + str(temp) + "_" + str(args.batch_idx)  + "_" + str(args.seed) + ".csv"), index=False)

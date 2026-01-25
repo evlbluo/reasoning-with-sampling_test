@@ -912,7 +912,31 @@ def plot_surprisal_timeline_plotly(
         # Generation region
         fig.add_vrect(x0=context_len, x1=len(steps), fillcolor=generation_color,
                      layer="below", line_width=0, row=row, col=1)
-        
+        # ADD: Overlay bin boundaries on the plot
+        if sampling_info is not None:
+            bin_boundaries = sampling_info.get('bin_boundaries', None)
+            window_start_global = sampling_info.get('window_start', context_len)
+            window_start_gen = max(0, window_start_global - context_len)
+            
+            if bin_boundaries is not None:
+                bin_colors = [
+                    'rgba(255, 99, 71, 0.15)', 'rgba(60, 179, 113, 0.15)',
+                    'rgba(70, 130, 180, 0.15)', 'rgba(255, 165, 0, 0.15)',
+                    'rgba(186, 85, 211, 0.15)', 'rgba(32, 178, 170, 0.15)',
+                    'rgba(255, 215, 0, 0.15)', 'rgba(147, 112, 219, 0.15)',
+                    'rgba(255, 105, 180, 0.15)', 'rgba(0, 206, 209, 0.15)',
+                ]
+                for b, (bin_start, bin_end) in enumerate(bin_boundaries):
+                    bin_start_gen = window_start_gen + bin_start
+                    bin_end_gen = window_start_gen + bin_end
+                    if bin_end_gen > 0 and bin_start_gen < len(steps):
+                        fig.add_vrect(
+                            x0=max(0, bin_start_gen), x1=min(len(steps), bin_end_gen),
+                            fillcolor=bin_colors[b % len(bin_colors)],
+                            layer="below", line_width=1 if row == 1 else 0,
+                            line=dict(color='gray', dash='dot') if row == 1 else None,
+                            row=row, col=1
+                        )
         # Cut point
         if current_idx is not None:
             fig.add_vline(x=current_idx, line_dash="dash", line_color="red",
@@ -969,8 +993,25 @@ def plot_surprisal_timeline_plotly(
         acceptance_rates = bandit_stats['acceptance_rates']
         num_bins = len(weights)
         
+        # ========== FIX: Create labels with position ranges ==========
+        bin_labels = []
+        if sampling_info is not None and 'bin_boundaries' in sampling_info:
+            bin_boundaries = sampling_info['bin_boundaries']
+            window_start_global = sampling_info.get('window_start', context_len)
+            window_start_gen = max(0, window_start_global - context_len)
+            
+            for b, (bs, be) in enumerate(bin_boundaries):
+                # Convert local bin boundaries to generation coordinates
+                gen_start = window_start_gen + bs
+                gen_end = window_start_gen + be
+                bin_labels.append(f"B{b}<br>[{gen_start},{gen_end})")
+        else:
+            # Fallback if no sampling_info
+            bin_labels = [f"B{b}" for b in range(num_bins)]
+        # ============================================================
+        
         fig.add_trace(
-            go.Bar(x=list(range(num_bins)), 
+            go.Bar(x=bin_labels,   # <-- FIXED: Now shows "B0\n[0,19)" etc.
                    y=weights / np.max(weights),
                    name='Normalized Weights',
                    marker_color='#9467bd',
@@ -979,7 +1020,7 @@ def plot_surprisal_timeline_plotly(
         )
         
         fig.add_trace(
-            go.Bar(x=list(range(num_bins)),
+            go.Bar(x=bin_labels,   # <-- FIXED: Same labels
                    y=acceptance_rates,
                    name='Acceptance Rate',
                    marker_color='#d62728',
@@ -1008,7 +1049,7 @@ def plot_surprisal_timeline_plotly(
         barmode='group'
     )
     
-    fig.update_xaxes(title_text="Token Position", row=3, col=1)
+    fig.update_xaxes(title_text="Generation Token Index (0 = first generated token)", row=3, col=1)
     fig.update_yaxes(title_text="Surprisal", row=1, col=1)
     fig.update_yaxes(title_text="Entropy", row=2, col=1)
     fig.update_yaxes(title_text="Velocity", row=3, col=1)
@@ -1594,7 +1635,9 @@ def mcmc_power_samp_with_plot(
                 current_entropy = list(full_entropy)
                 current_velocities = list(full_velocities)
                 current_surprisal = list(full_surprisal)
-                current_tokens = [p.tokenizer.decode([tid]) for tid in gen]
+                # current_tokens = [p.tokenizer.decode([tid]) for tid in gen]
+                # FIX: Only include generation tokens (skip prompt) to match surprisal array length
+                current_tokens = [p.tokenizer.decode([tid]) for tid in gen[c:]]
                 
                 # Get bandit stats if available
                 bandit_stats = None

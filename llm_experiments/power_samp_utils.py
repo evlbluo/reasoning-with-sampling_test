@@ -162,15 +162,18 @@ class BinBandit:
     
     def get_stats(self):
         """Return statistics about bin performance."""
-        return {
-            'weights': self.weights.copy(),
-            'attempts': self.bin_attempts.copy(),
-            'accepts': self.bin_accepts.copy(),
-            'acceptance_rates': np.where(
+        # Compute acceptance rates, avoiding divide-by-zero warning
+        with np.errstate(divide='ignore', invalid='ignore'):
+            acceptance_rates = np.where(
                 self.bin_attempts > 0,
                 self.bin_accepts / self.bin_attempts,
                 0.0
             )
+        return {
+            'weights': self.weights.copy(),
+            'attempts': self.bin_attempts.copy(),
+            'accepts': self.bin_accepts.copy(),
+            'acceptance_rates': acceptance_rates
         }
 
 

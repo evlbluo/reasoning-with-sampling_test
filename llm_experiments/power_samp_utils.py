@@ -1481,6 +1481,14 @@ def mcmc_power_samp_with_plot(
             print(f"  Current sequence length: {len(gen)}")
             print(f"  Current full_surprisal length: {len(full_surprisal)}")
             print(f"{'='*60}")
+        # ========== FIX: Reset bandit for new block ==========
+        if use_adaptive_cut and cut_point_sampler is not None:
+            cut_point_sampler.reset()
+            if verbose:
+                print(f"  [Bandit Reset] Weights reset for new block")
+        # =====================================================
+
+        
         
         # Generate new tokens for this block
         gen, lp_norm, lp_unnorm, h_last, entropy = naive_temp(

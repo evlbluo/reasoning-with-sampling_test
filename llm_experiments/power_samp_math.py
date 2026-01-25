@@ -47,6 +47,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", action = "store", type = int, default = 0)
     
     # ===== NEW: Adaptive Cut-Point Selection Arguments =====
+    # ===== Hyperpaprameters =====
     parser.add_argument("--use_adaptive_cut", action = "store_true", default = True,
                         help = "Use adaptive cut-point selection (bin-bandit with surprisal prior)")
     parser.add_argument("--no_adaptive_cut", action = "store_false", dest = "use_adaptive_cut",
@@ -57,7 +58,7 @@ if __name__ == "__main__":
                         help = "Mix factor for surprisal prior with uniform distribution")
     parser.add_argument("--adaptive_epsilon", action = "store", type = float, default = 0.1,
                         help = "Probability of forced uniform exploration")
-    parser.add_argument("--adaptive_refractory_radius", action = "store", type = int, default = 10,
+    parser.add_argument("--adaptive_refractory_radius", action = "store", type = int, default = 9,
                         help = "Radius W for anti-repeat refractory masking")
     parser.add_argument("--adaptive_bandit_gamma", action = "store", type = float, default = 0.1,
                         help = "Exploration rate gamma for EXP3 bandit")

@@ -40,6 +40,34 @@ if __name__ == "__main__":
     parser.add_argument("--device", action = "store", type = str, dest = "device", default = "cuda" if torch.cuda.is_available() else 'cpu')
     parser.add_argument("--batch_idx", action = "store", type = int, default = 0)
     parser.add_argument("--seed", action = "store", type = int, default = 0)
+    
+    # ===== NEW: Adaptive Cut-Point Selection Arguments =====
+    # ===== Hyperpaprameters =====
+    parser.add_argument("--use_adaptive_cut", action = "store_true", default = True,
+                        help = "Use adaptive cut-point selection (bin-bandit with surprisal prior)")
+    parser.add_argument("--no_adaptive_cut", action = "store_false", dest = "use_adaptive_cut",
+                        help = "Disable adaptive cut-point selection (use random cuts)")
+    parser.add_argument("--adaptive_num_bins", action = "store", type = int, default = 10,
+                        help = "Number of bins B for the bin-bandit (fixed, bin size adapts to window)")
+    parser.add_argument("--adaptive_delta", action = "store", type = float, default = 0.1,
+                        help = "Mix factor for surprisal prior with uniform distribution")
+    parser.add_argument("--adaptive_epsilon", action = "store", type = float, default = 0.3,
+                        help = "Probability of forced uniform exploration")
+    parser.add_argument("--adaptive_refractory_radius", action = "store", type = int, default = 9,
+                        help = "Radius W for anti-repeat refractory masking")
+    parser.add_argument("--adaptive_bandit_gamma", action = "store", type = float, default = 0.1,
+                        help = "Exploration rate gamma for EXP3 bandit")
+    parser.add_argument("--adaptive_bandit_eta", action = "store", type = float, default = 0.1,
+                        help = "Learning rate eta for EXP3 bandit weight updates")
+    parser.add_argument("--adaptive_bandit_decay", action = "store", type = float, default = 0.02,
+                        help = "Weight decay lambda for handling non-stationarity")
+    parser.add_argument("--verbose", action = "store_true", default = True,
+                        help = "Enable verbose logging during MCMC")
+    parser.add_argument("--no_verbose", action = "store_false", dest = "verbose",
+                        help = "Disable verbose logging")
+    # ===== END NEW ARGUMENTS =====
+    
+    
     args = parser.parse_args()
 
     random.seed(0)
@@ -89,8 +117,8 @@ if __name__ == "__main__":
     print("loaded models")
     results = []
 
-    start = 41*args.batch_idx
-    end = 41*(args.batch_idx+1)
+    start = 2*args.batch_idx
+    end = 2*(args.batch_idx+1)
 
     for problem, data in tqdm(enumerate(dataset[start:end]), desc = "Benchmark on HumanEval"):
         prompt = data["prompt"]
@@ -139,17 +167,41 @@ if __name__ == "__main__":
         print(tokenizer.decode(std_output[0][:, len(input_ids[0]):].squeeze().to("cpu"), skip_special_tokens=True))
         print("std done")
 
-        mcmc_temp_output, _, _, acceptance_ratio = mcmc_power_samp(autoreg_sampler, prefx, temp, mcmc_steps, max_new_tokens=3072)
-
+                # ===== MCMC WITH ADAPTIVE CUT-POINT SELECTION =====
+        mcmc_power_samp_output, _, _, acceptance_ratio = mcmc_power_samp_with_plot(
+          autoreg_sampler,
+          prefx,
+          temp,
+          mcmc_steps,
+          max_new_tokens=3072,
+          block_num=16,
+          plot_every=1,          # Plot every N MCMC steps
+          save_plots=True,
+          plot_dir="mcmc_plots",
+          use_plotly=True,
+          window_size=5,
+          peak_distance=10,
+          peak_prominence=0.3,
+          # Adaptive cut-point parameters (window size is now DYNAMIC)
+          use_adaptive_cut=args.use_adaptive_cut,
+          adaptive_num_bins=args.adaptive_num_bins,
+          adaptive_delta=args.adaptive_delta,
+          adaptive_epsilon=args.adaptive_epsilon,
+          adaptive_refractory_radius=args.adaptive_refractory_radius,
+          adaptive_bandit_gamma=args.adaptive_bandit_gamma,
+          adaptive_bandit_eta=args.adaptive_bandit_eta,
+          adaptive_bandit_decay=args.adaptive_bandit_decay,
+          verbose=args.verbose,
+        )
         print(len(std_output))
         print(len(naive_temp_output))
-        print(len(mcmc_temp_output))
-        print(tokenizer.decode(torch.tensor([mcmc_temp_output], dtype=torch.long, device=device).squeeze().to("cpu"), skip_special_tokens=True))
+        print(len(mcmc_power_samp_output))
+        print(tokenizer.decode(torch.tensor([mcmc_power_samp_output], dtype=torch.long, device=device).squeeze().to("cpu"), skip_special_tokens=True))
         print("mcmc done")
 
         naive_generated_ids = naive_temp_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
         std_generated_ids = std_output[0][:, len(input_ids[0]):].squeeze().to("cpu")
-        mcmc_temp_ids = torch.tensor([mcmc_temp_output], dtype=torch.long, device=device).squeeze().to("cpu")
+        mcmc_temp_ids = torch.tensor([mcmc_power_samp_output], dtype=torch.long, device=device).squeeze().to("cpu")
 
         naive_completion = tokenizer.decode(naive_generated_ids, skip_special_tokens=True)
         std_completion = tokenizer.decode(std_generated_ids, skip_special_tokens=True)
